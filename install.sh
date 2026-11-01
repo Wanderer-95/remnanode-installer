@@ -258,13 +258,32 @@ remove_remnanode() {
 # PACKAGES
 # ============================================================
 
+wait_for_apt() {
+    local waited=0
+
+    while pgrep -x unattended-upgr >/dev/null ||
+          pgrep -x apt-get >/dev/null ||
+          pgrep -x dpkg >/dev/null; do
+        if (( waited == 0 )); then
+            warn "Ждём завершения apt / unattended-upgrades..."
+        fi
+
+        sleep 5
+        waited=$((waited + 5))
+
+        (( waited < 600 )) || die "apt занят более 10 минут. Проверьте процессы apt и dpkg."
+    done
+}
+
 install_packages() {
     log "Установка необходимых пакетов..."
 
     export DEBIAN_FRONTEND=noninteractive
 
+    wait_for_apt
     apt-get update
 
+    wait_for_apt
     apt-get install -y \
         ca-certificates \
         curl \
@@ -902,22 +921,49 @@ get_nginx_version() {
 }
 
 install_nginx_from_org() {
-    local codename
+    # Вызывается в условии if, поэтому set -e здесь не работает.
+    # Каждый шаг проверяем явно.
+    local codename key_tmp
+
     codename="$(. /etc/os-release && echo "${VERSION_CODENAME:-}")"
+    [[ -n "${codename}" ]] || { warn "Не удалось определить codename Ubuntu."; return 1; }
 
-    [[ -n "${codename}" ]] || return 1
+    key_tmp="$(mktemp)"
 
-    curl -fsSL https://nginx.org/keys/nginx_signing.key |
-        gpg --dearmor --yes -o "${NGINX_KEYRING}" || return 1
+    if ! curl -fsSL https://nginx.org/keys/nginx_signing.key -o "${key_tmp}"; then
+        warn "Не удалось скачать ключ nginx.org."
+        rm -f "${key_tmp}"
+        return 1
+    fi
+
+    # Проверяем, что ключ действительно тот, которым подписан репозиторий.
+    if ! gpg --show-keys --with-colons "${key_tmp}" 2>/dev/null |
+         grep -q '^fpr:.*2FD21310B49F6B46:$'; then
+        warn "Ключ nginx.org не совпал с ожидаемым отпечатком."
+        rm -f "${key_tmp}"
+        return 1
+    fi
+
+    if ! gpg --dearmor --yes -o "${NGINX_KEYRING}" "${key_tmp}"; then
+        warn "Не удалось сохранить ключ nginx.org."
+        rm -f "${key_tmp}"
+        return 1
+    fi
+
+    rm -f "${key_tmp}"
 
     echo "deb [signed-by=${NGINX_KEYRING}] http://nginx.org/packages/ubuntu ${codename} nginx" \
         > "${NGINX_REPO_LIST}"
 
-    # Приоритет репозитория nginx.org над репозиторием Ubuntu.
     printf 'Package: *\nPin: origin nginx.org\nPin-Priority: 900\n' > "${NGINX_PIN}"
 
+    wait_for_apt
     apt-get update || return 1
+
+    wait_for_apt
     apt-get install -y nginx || return 1
+
+    return 0
 }
 
 install_nginx_latest() {
@@ -929,6 +975,14 @@ install_nginx_latest() {
         log "nginx установлен из официального репозитория nginx.org."
     else
         warn "Не удалось установить nginx из nginx.org. Используем версию из Ubuntu."
+
+        # Убираем репозиторий nginx.org, чтобы apt update не падал на нём.
+        rm -f "${NGINX_REPO_LIST}" "${NGINX_PIN}"
+
+        wait_for_apt
+        apt-get update
+
+        wait_for_apt
         apt-get install -y nginx
     fi
 
