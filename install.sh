@@ -187,7 +187,21 @@ backup_file() {
 read_existing_secret() {
     if [[ -f "${ENV_FILE}" ]]; then
         EXISTING_SECRET_KEY="$(
-            sed -n 's/^SECRET_KEY=//p' "${ENV_FILE}" | head -n 1
+            python3 - "${ENV_FILE}" <<'PY'
+import re
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as f:
+    for line in f:
+        if line.startswith("SECRET_KEY="):
+            value = line.rstrip("\n")[len("SECRET_KEY="):]
+            if len(value) >= 2 and value[0] == value[-1] == '"':
+                value = value[1:-1]
+            # Снимаем экранирование, которое добавляет create_configuration.
+            value = re.sub(r'\\(.)', r'\1', value)
+            print(value)
+            break
+PY
         )"
     fi
 }
@@ -750,12 +764,29 @@ read_secret_key() {
     echo
 
     if [[ -n "${EXISTING_SECRET_KEY}" ]]; then
-        log "Существующий SECRET_KEY будет сохранён."
-        SECRET_KEY="${EXISTING_SECRET_KEY}"
-        return
+        echo "Найден SECRET_KEY из предыдущей установки."
+        echo "1) Оставить существующий"
+        echo "2) Ввести новый (из панели Remnawave)"
+        echo
+
+        read -r -p "Выберите [1/2]: " key_choice
+
+        case "${key_choice}" in
+            1)
+                SECRET_KEY="${EXISTING_SECRET_KEY}"
+                log "Используется существующий SECRET_KEY."
+                return
+                ;;
+            2)
+                ;;
+            *)
+                die "Неверный выбор."
+                ;;
+        esac
     fi
 
-    echo "Введите SECRET_KEY Remnawave Node."
+    echo
+    echo "Введите SECRET_KEY Remnawave Node из панели."
     echo "Значение не будет отображаться на экране."
     echo
 
@@ -763,18 +794,22 @@ read_secret_key() {
         read -r -s -p "SECRET_KEY: " SECRET_KEY
         echo
 
-        [[ -n "${SECRET_KEY}" ]] || {
+        if [[ -z "${SECRET_KEY}" ]]; then
             warn "SECRET_KEY не может быть пустым."
             continue
-        }
+        fi
 
         read -r -s -p "Повторите SECRET_KEY: " SECRET_KEY_CONFIRM
         echo
 
-        [[ "${SECRET_KEY}" == "${SECRET_KEY_CONFIRM}" ]] && break
+        if [[ "${SECRET_KEY}" == "${SECRET_KEY_CONFIRM}" ]]; then
+            break
+        fi
 
         warn "Значения не совпадают."
     done
+
+    log "SECRET_KEY принят."
 }
 
 # ============================================================
