@@ -817,12 +817,15 @@ read_secret_key() {
 # ============================================================
 
 detect_ssh_port() {
-    local ssh_port="22"
+    local ssh_port=""
 
     if command -v sshd >/dev/null 2>&1; then
+        # Каталог нужен sshd -T; без него sshd завершается с ошибкой.
+        mkdir -p /run/sshd 2>/dev/null || true
+
         ssh_port="$(
             sshd -T 2>/dev/null |
-            awk '$1=="port" {print $2; exit}'
+            awk '$1=="port" {print $2; exit}' || true
         )"
     fi
 
@@ -847,8 +850,12 @@ configure_firewall() {
     ufw allow 8443/tcp comment 'Remnawave Node' >/dev/null
     ufw allow 80/tcp comment 'HTTP' >/dev/null
 
-    if ufw status | grep -q "Status: inactive"; then
-        ufw --force enable
+    # Сохраняем вывод в переменную, чтобы grep не закрывал пайп раньше времени.
+    local ufw_state
+    ufw_state="$(ufw status 2>/dev/null || true)"
+
+    if grep -q "Status: inactive" <<< "${ufw_state}"; then
+        ufw --force enable >/dev/null
     fi
 
     log "UFW настроен. SSH-порт: ${ssh_port}."
