@@ -258,32 +258,47 @@ remove_remnanode() {
 # PACKAGES
 # ============================================================
 
-wait_for_apt() {
-    local waited=0
+prepare_apt() {
+    export DEBIAN_FRONTEND=noninteractive
 
-    while pgrep -x unattended-upgr >/dev/null ||
-          pgrep -x apt-get >/dev/null ||
-          pgrep -x dpkg >/dev/null; do
+    if ! command -v fuser >/dev/null 2>&1; then
+        apt-get update >/dev/null 2>&1 || true
+        apt-get install -y psmisc >/dev/null 2>&1 ||
+            die "Не удалось установить psmisc (нужен для проверки блокировок apt)."
+    fi
+
+    local waited=0
+    local locks=(/var/lib/dpkg/lock-frontend /var/lib/dpkg/lock /var/lib/apt/lists/lock)
+
+    while fuser "${locks[@]}" >/dev/null 2>&1; do
         if (( waited == 0 )); then
-            warn "Ждём завершения apt / unattended-upgrades..."
+            warn "Ждём освобождения блокировки apt (обычно это unattended-upgrades)..."
         fi
 
         sleep 5
         waited=$((waited + 5))
 
-        (( waited < 600 )) || die "apt занят более 10 минут. Проверьте процессы apt и dpkg."
+        (( waited < 600 )) ||
+            die "Блокировка apt занята более 10 минут. Проверьте: fuser -v /var/lib/dpkg/lock-frontend"
     done
+
+    (( waited == 0 )) || log "Блокировка apt освобождена."
+
+    dpkg --configure -a >/dev/null 2>&1 ||
+        die "dpkg не смог завершить незавершённые пакеты. Запустите вручную: dpkg --configure -a"
+}
+
+wait_for_apt() {
+    prepare_apt
 }
 
 install_packages() {
     log "Установка необходимых пакетов..."
 
-    export DEBIAN_FRONTEND=noninteractive
+    prepare_apt
 
-    wait_for_apt
     apt-get update
 
-    wait_for_apt
     apt-get install -y \
         ca-certificates \
         curl \
@@ -293,7 +308,8 @@ install_packages() {
         iproute2 \
         iptables \
         kmod \
-        ufw
+        ufw \
+        psmisc
 
     log "Необходимые пакеты установлены."
 }
