@@ -2,7 +2,8 @@
 
 set -Eeuo pipefail
 
-VERSION="1.3.0"
+# Не используем VERSION: её перезаписывает /etc/os-release.
+INSTALLER_VERSION="1.4.0"
 
 INSTALL_DIR="/opt/remnanode"
 CONTAINER_NAME="remnanode"
@@ -16,15 +17,25 @@ DOCKER_DROPIN="/etc/systemd/system/docker.service.d/99-remnanode-limits.conf"
 DOCKER_DAEMON_JSON="/etc/docker/daemon.json"
 JOURNALD_DROPIN="/etc/systemd/journald.conf.d/99-remnanode.conf"
 
+NGINX_CONF="/etc/nginx/conf.d/remnanode-selfsteal.conf"
+NGINX_KEYRING="/usr/share/keyrings/nginx-archive-keyring.gpg"
+NGINX_REPO_LIST="/etc/apt/sources.list.d/nginx.list"
+NGINX_PIN="/etc/apt/preferences.d/99-nginx-org"
 SITE_ROOT="/var/www/html"
-SITE_BACKUP_DIR="/var/backups/remnanode-site"
+PROFILE_FILE="/root/remnanode-profile.json"
 
 BACKUP_SUFFIX="$(date +%Y%m%d-%H%M%S)"
 DOCKER_RESTARTED=0
 MAIN_INTERFACE=""
 EXISTING_SECRET_KEY=""
+SECRET_KEY=""
+REINSTALL=0
+SELFSTEAL=0
 SITE_DOMAIN=""
-SITE_TMP_SCRIPT=""
+INBOUND_NAME=""
+NGINX_VERSION=""
+PRIVATE_KEY=""
+SHORT_ID=""
 
 # ============================================================
 # COLORS AND LOGGING
@@ -78,40 +89,74 @@ check_system() {
     fi
 
     log "Операционная система: ${PRETTY_NAME}"
-    log "Версия установщика: ${VERSION}"
+    log "Версия установщика: ${INSTALLER_VERSION}"
 }
 
 # ============================================================
 # MENU
 # ============================================================
 
-show_menu() {
+select_reinstall_mode() {
     echo
-    echo "========================================"
-    echo "       REMNAWAVE NODE INSTALLER"
-    echo "              v${VERSION}"
-    echo "========================================"
-    echo
-    echo "1) Чистая установка"
-    echo "2) Удалить Remnawave Node и установить заново"
+    echo "Переустановка Remnawave Node:"
+    echo "1) Установка без self-steal"
+    echo "2) Установка с self-steal"
     echo "0) Выход"
     echo
+
+    read -r -p "Выберите тип установки: " choice
+
+    case "${choice}" in
+        1)
+            SELFSTEAL=0
+            ;;
+        2)
+            SELFSTEAL=1
+            ;;
+        0)
+            exit 0
+            ;;
+        *)
+            die "Неверный пункт меню."
+            ;;
+    esac
+
+    REINSTALL=1
+
+    warn "Будет удалён текущий Remnawave Node."
+    warn "Docker, SSH, UFW и остальные контейнеры сохраняются."
+    read -r -p "Для подтверждения введите DELETE: " confirm
+    [[ "${confirm}" == "DELETE" ]] || die "Операция отменена."
 }
 
 select_mode() {
-    show_menu
+    echo
+    echo "========================================"
+    echo "       REMNAWAVE NODE INSTALLER"
+    echo "            v${INSTALLER_VERSION}"
+    echo "========================================"
+    echo
+    echo "1) Установка без self-steal"
+    echo "2) Установка с self-steal"
+    echo "3) Удалить Remnawave Node и установить заново"
+    echo "0) Выход"
+    echo
 
-    read -r -p "Выберите действие: " MODE
+    read -r -p "Выберите действие: " choice
 
-    case "${MODE}" in
+    case "${choice}" in
         1)
-            log "Выбрана чистая установка."
+            REINSTALL=0
+            SELFSTEAL=0
+            log "Выбрана установка без self-steal."
             ;;
         2)
-            warn "Будет удалён текущий Remnawave Node."
-            warn "Docker, SSH, UFW и остальные контейнеры сохраняются."
-            read -r -p "Для подтверждения введите DELETE: " confirm
-            [[ "${confirm}" == "DELETE" ]] || die "Операция отменена."
+            REINSTALL=0
+            SELFSTEAL=1
+            log "Выбрана установка с self-steal."
+            ;;
+        3)
+            select_reinstall_mode
             ;;
         0)
             exit 0
@@ -155,6 +200,17 @@ docker_container_exists() {
     docker container inspect "${CONTAINER_NAME}" >/dev/null 2>&1
 }
 
+remove_selfsteal_config() {
+    if [[ -f "${NGINX_CONF}" ]]; then
+        rm -f "${NGINX_CONF}"
+        log "Удалён конфиг self-steal: ${NGINX_CONF}"
+
+        if command -v nginx >/dev/null 2>&1 && nginx -t >/dev/null 2>&1; then
+            systemctl reload nginx || warn "Не удалось перезагрузить nginx."
+        fi
+    fi
+}
+
 remove_remnanode() {
     log "Удаление предыдущего Remnawave Node..."
 
@@ -194,6 +250,8 @@ remove_remnanode() {
             info "Образ используется другим контейнером. Оставляем его."
         fi
     fi
+
+    remove_selfsteal_config
 }
 
 # ============================================================
@@ -210,13 +268,13 @@ install_packages() {
     apt-get install -y \
         ca-certificates \
         curl \
+        gnupg \
         openssl \
         python3 \
         iproute2 \
         iptables \
         kmod \
-        ufw \
-        nginx
+        ufw
 
     log "Необходимые пакеты установлены."
 }
@@ -594,10 +652,6 @@ restart_docker() {
     log "Docker успешно перезапущен."
 }
 
-# ============================================================
-# DOCKER LIMIT VERIFICATION
-# ============================================================
-
 verify_docker_limits() {
     log "Проверка фактических лимитов процесса Docker..."
 
@@ -638,10 +692,6 @@ verify_docker_limits() {
 
     log "Фактические лимиты Docker подтверждены."
 }
-
-# ============================================================
-# DOCKER LOGGING VERIFICATION
-# ============================================================
 
 verify_docker_logging() {
     log "Проверка Docker logging..."
@@ -839,20 +889,155 @@ start_node() {
 }
 
 # ============================================================
-# SITE INSTALLATION (CTRL+D INPUT)
+# NGINX (SELF-STEAL)
 # ============================================================
 
-ask_site_domain() {
+version_ge() {
+    # Возвращает успех, если $1 >= $2.
+    [[ "$(printf '%s\n' "$1" "$2" | sort -V | head -n 1)" == "$2" ]]
+}
+
+get_nginx_version() {
+    nginx -v 2>&1 | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -n 1
+}
+
+install_nginx_from_org() {
+    local codename
+    codename="$(. /etc/os-release && echo "${VERSION_CODENAME:-}")"
+
+    [[ -n "${codename}" ]] || return 1
+
+    curl -fsSL https://nginx.org/keys/nginx_signing.key |
+        gpg --dearmor --yes -o "${NGINX_KEYRING}" || return 1
+
+    echo "deb [signed-by=${NGINX_KEYRING}] http://nginx.org/packages/ubuntu ${codename} nginx" \
+        > "${NGINX_REPO_LIST}"
+
+    # Приоритет репозитория nginx.org над репозиторием Ubuntu.
+    printf 'Package: *\nPin: origin nginx.org\nPin-Priority: 900\n' > "${NGINX_PIN}"
+
+    apt-get update || return 1
+    apt-get install -y nginx || return 1
+}
+
+install_nginx_latest() {
+    log "Установка последней стабильной версии nginx..."
+
+    export DEBIAN_FRONTEND=noninteractive
+
+    if install_nginx_from_org; then
+        log "nginx установлен из официального репозитория nginx.org."
+    else
+        warn "Не удалось установить nginx из nginx.org. Используем версию из Ubuntu."
+        apt-get install -y nginx
+    fi
+
+    systemctl enable nginx >/dev/null 2>&1 || true
+
+    NGINX_VERSION="$(get_nginx_version)"
+
+    [[ -n "${NGINX_VERSION}" ]] || die "Не удалось определить версию nginx."
+
+    log "Версия nginx: ${NGINX_VERSION}"
+}
+
+disable_default_nginx_sites() {
+    rm -f /etc/nginx/sites-enabled/default
+
+    if [[ -f /etc/nginx/conf.d/default.conf ]]; then
+        mv /etc/nginx/conf.d/default.conf \
+           "/etc/nginx/conf.d/default.conf.bak.${BACKUP_SUFFIX}"
+        log "Стандартный конфиг nginx отключён."
+    fi
+}
+
+write_nginx_config() {
+    # $1: http (только порт 80 для получения сертификата) или ssl (финальный конфиг)
+    local stage="$1"
+
+    local listen_line="listen 127.0.0.1:8443 ssl;"
+    local http2_line="    http2 on;"
+
+    if ! version_ge "${NGINX_VERSION}" "1.25.0"; then
+        listen_line="listen 127.0.0.1:8443 ssl http2;"
+        http2_line=""
+    fi
+
+    mkdir -p /etc/nginx/conf.d
+
+    if [[ "${stage}" == "http" ]]; then
+        cat > "${NGINX_CONF}" <<'NGINX'
+server {
+    listen 80;
+    listen [::]:80;
+    server_name __DOMAIN__;
+    root /var/www/html;
+    location /.well-known/acme-challenge/ { allow all; }
+    location / { return 200 'ok'; add_header Content-Type text/plain; }
+}
+NGINX
+    else
+        cat > "${NGINX_CONF}" <<'NGINX'
+server {
+    listen 80;
+    listen [::]:80;
+    server_name __DOMAIN__;
+    root /var/www/html;
+    location /.well-known/acme-challenge/ { allow all; }
+    location / { return 301 https://$host$request_uri; }
+}
+
+server {
+    __LISTEN__
+__HTTP2__
+    server_name __DOMAIN__;
+
+    ssl_certificate     /etc/letsencrypt/live/__DOMAIN__/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/__DOMAIN__/privkey.pem;
+    ssl_protocols TLSv1.2 TLSv1.3;
+    ssl_session_cache shared:SSL:10m;
+    ssl_session_timeout 1d;
+
+    root /var/www/html;
+    index index.html;
+    error_page 404 /404.html;
+    add_header X-Content-Type-Options nosniff;
+
+    location / { try_files $uri $uri/ =404; }
+}
+NGINX
+    fi
+
+    sed -i \
+        -e "s|__DOMAIN__|${SITE_DOMAIN}|g" \
+        -e "s|__LISTEN__|${listen_line}|g" \
+        -e "s|__HTTP2__|${http2_line}|g" \
+        "${NGINX_CONF}"
+
+    log "Конфиг nginx записан: ${NGINX_CONF}"
+}
+
+install_certbot_hook() {
+    mkdir -p /etc/letsencrypt/renewal-hooks/deploy
+
+    printf '#!/bin/sh\nsystemctl reload nginx\n' \
+        > /etc/letsencrypt/renewal-hooks/deploy/reload-nginx.sh
+
+    chmod +x /etc/letsencrypt/renewal-hooks/deploy/reload-nginx.sh
+}
+
+ask_selfsteal_domain() {
     local domain
 
     while true; do
         echo
-        read -r -p "Введите домен сайта (например, example.com): " domain
+        read -r -p "Введите домен для ноды (например, node.example.com): " domain
         domain="${domain,,}"
 
         if [[ "${domain}" =~ ^([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}$ ]]; then
             SITE_DOMAIN="${domain}"
-            log "Домен сайта: ${SITE_DOMAIN}"
+            log "Домен: ${SITE_DOMAIN}"
+            info "Домен должен already указывать A-записью на IP этого сервера."
             return 0
         fi
 
@@ -860,27 +1045,97 @@ ask_site_domain() {
     done
 }
 
-read_site_script() {
+configure_selfsteal_nginx() {
     echo
-    info "Вставьте Bash-скрипт сайта целиком."
+    log "Настройка nginx для self-steal..."
+
+    install_nginx_latest
+    disable_default_nginx_sites
+
+    mkdir -p "${SITE_ROOT}"
+
+    # Сначала HTTP-конфиг, чтобы certbot смог пройти проверку.
+    write_nginx_config http
+
+    nginx -t || die "Конфигурация nginx не прошла проверку."
+    systemctl restart nginx
+}
+
+configure_selfsteal_certificate() {
+    log "Получение сертификата Let's Encrypt..."
+
+    apt-get install -y certbot
+
+    certbot certonly \
+        --webroot -w "${SITE_ROOT}" \
+        -d "${SITE_DOMAIN}" \
+        --agree-tos \
+        --register-unsafely-without-email \
+        --non-interactive \
+        --keep-until-expiring ||
+        die "Не удалось получить сертификат. Проверьте DNS-запись домена и открытый порт 80."
+
+    [[ -f "/etc/letsencrypt/live/${SITE_DOMAIN}/fullchain.pem" ]] ||
+        die "Сертификат не найден после выпуска."
+
+    install_certbot_hook
+
+    certbot renew --dry-run ||
+        warn "Проверка автообновления сертификата не прошла. Проверьте порт 80 и DNS."
+
+    log "Сертификат получен."
+}
+
+configure_selfsteal_final() {
+    log "Применение финального конфига nginx..."
+
+    write_nginx_config ssl
+
+    nginx -t || die "Финальный конфиг nginx не прошёл проверку."
+    systemctl restart nginx
+
+    systemctl is-active --quiet nginx || die "Nginx не запущен."
+
+    log "Nginx настроен для self-steal."
+}
+
+check_site_placeholder() {
+    local code
+    code="$(
+        curl -sk -o /dev/null -w '%{http_code}' \
+            https://127.0.0.1:8443/ \
+            -H "Host: ${SITE_DOMAIN}" || true
+    )"
+
+    echo "local=${code}"
+    info "Ответ 404 или 403 нормален, пока сайт не загружен."
+}
+
+install_site() {
+    echo
+    info "Вставьте сайт целиком."
+    info "Если это HTML-страница, вставьте её как есть."
+    info "Если это Bash-скрипт генератора, вставьте его целиком."
     info "Затем на новой пустой строке нажмите Ctrl+D."
     echo
 
-    SITE_TMP_SCRIPT="$(mktemp /tmp/remnanode-site.XXXXXX.sh)"
-    chmod 600 "${SITE_TMP_SCRIPT}"
+    local tmp_site
+    tmp_site="$(mktemp /tmp/remnanode-site.XXXXXX)"
+    chmod 600 "${tmp_site}"
 
-    cat > "${SITE_TMP_SCRIPT}"
+    cat > "${tmp_site}"
 
-    [[ -s "${SITE_TMP_SCRIPT}" ]] ||
-        die "Скрипт сайта пустой."
+    [[ -s "${tmp_site}" ]] || die "Сайт пустой."
 
-    log "Скрипт сайта получен: $(wc -l < "${SITE_TMP_SCRIPT}") строк."
-}
+    mkdir -p "${SITE_ROOT}"
 
-prepare_site_script() {
-    log "Подготовка скрипта сайта..."
+    if grep -qiE '<!doctype html|<html' "${tmp_site}"; then
+        cp "${tmp_site}" "${SITE_ROOT}/index.html"
+        log "HTML-страница сохранена как index.html."
+    else
+        log "Выполнение скрипта сайта..."
 
-    SITE_DOMAIN="${SITE_DOMAIN}" SITE_TMP="${SITE_TMP_SCRIPT}" python3 - <<'PY'
+        SITE_DOMAIN="${SITE_DOMAIN}" SITE_TMP="${tmp_site}" python3 - <<'PY'
 import os
 
 path = os.environ["SITE_TMP"]
@@ -896,114 +1151,188 @@ with open(path, "w", encoding="utf-8") as f:
     f.write(text)
 PY
 
-    log "Путь заменён на /var/www/html, домен заменён на ${SITE_DOMAIN}."
-}
-
-backup_site() {
-    mkdir -p "${SITE_ROOT}"
-    mkdir -p "${SITE_BACKUP_DIR}"
-    chmod 700 "${SITE_BACKUP_DIR}"
-
-    if [[ -n "$(ls -A "${SITE_ROOT}" 2>/dev/null)" ]]; then
-        local backup="${SITE_BACKUP_DIR}/site-${BACKUP_SUFFIX}.tar.gz"
-
-        tar -czf "${backup}" -C "${SITE_ROOT}" .
-        log "Резервная копия предыдущего сайта: ${backup}"
-
-        find "${SITE_ROOT}" -mindepth 1 -delete
-        log "Содержимое ${SITE_ROOT} очищено перед установкой."
-    else
-        info "Предыдущий сайт не найден."
+        bash "${tmp_site}" || die "Скрипт сайта завершился с ошибкой."
     fi
-}
 
-run_site_generator() {
-    log "Запуск генератора сайта..."
-
-    # Скрипт выполняется отдельным процессом, не через eval.
-    bash "${SITE_TMP_SCRIPT}" ||
-        die "Генератор сайта завершился с ошибкой. Профиль не создан."
-
-    rm -f "${SITE_TMP_SCRIPT}"
-
-    log "Генератор сайта выполнен."
-}
-
-verify_site_files() {
-    log "Проверка файлов сайта..."
+    rm -f "${tmp_site}"
 
     [[ -f "${SITE_ROOT}/index.html" ]] ||
         die "Не найден index.html в ${SITE_ROOT}."
 
-    [[ -n "$(find "${SITE_ROOT}" -type f -name '*.css' -print -quit)" ]] ||
-        die "Не найден CSS-файл в ${SITE_ROOT}."
-
-    [[ -n "$(find "${SITE_ROOT}" -type f -name '*.js' -print -quit)" ]] ||
-        die "Не найден JavaScript-файл в ${SITE_ROOT}."
-
-    log "Найдены index.html, CSS и JavaScript."
-}
-
-set_site_permissions() {
-    log "Настройка прав доступа к сайту..."
-
-    chown -R www-data:www-data "${SITE_ROOT}"
     find "${SITE_ROOT}" -type d -exec chmod 755 {} +
     find "${SITE_ROOT}" -type f -exec chmod 644 {} +
 
-    log "Права доступа установлены."
+    log "Файлы сайта установлены в ${SITE_ROOT}."
 }
 
-verify_site_nginx() {
-    log "Проверка сайта через Nginx..."
+verify_site() {
+    log "Проверка сайта через nginx..."
 
-    systemctl enable nginx >/dev/null 2>&1 || true
-
-    nginx -t ||
-        die "Конфигурация Nginx не прошла проверку."
-
-    if systemctl is-active --quiet nginx; then
-        systemctl reload nginx
-    else
-        systemctl start nginx
-    fi
-
-    systemctl is-active --quiet nginx ||
-        die "Nginx не запущен."
-
-    local http_code
-    http_code="$(
-        curl -s -o /dev/null -w '%{http_code}' \
-            -H "Host: ${SITE_DOMAIN}" \
-            http://127.0.0.1/ || true
+    local code
+    code="$(
+        curl -sk -o /dev/null -w '%{http_code}' \
+            https://127.0.0.1:8443/ \
+            -H "Host: ${SITE_DOMAIN}" || true
     )"
 
-    echo "HTTP-код локальной проверки: ${http_code}"
+    echo "local=${code}"
 
-    [[ "${http_code}" == "200" ]] ||
-        die "Сайт не отвечает с кодом 200 через Nginx."
+    [[ "${code}" == "200" ]] ||
+        die "Сайт не отвечает с кодом 200 (получен ${code})."
 
-    log "Сайт отвечает через Nginx."
+    log "Сайт открывается по домену ${SITE_DOMAIN}."
 }
 
-configure_site() {
-    echo
-    log "Установка сайта-маскировки..."
-
-    ask_site_domain
-    read_site_script
-    prepare_site_script
-    backup_site
-    run_site_generator
-    verify_site_files
-    set_site_permissions
-    verify_site_nginx
-
-    log "Сайт ${SITE_DOMAIN} установлен."
+configure_selfsteal() {
+    ask_selfsteal_domain
+    configure_selfsteal_nginx
+    configure_selfsteal_certificate
+    configure_selfsteal_final
+    check_site_placeholder
+    install_site
+    verify_site
 }
 
 # ============================================================
-# GENERATE PARAMETERS
+# INBOUND AND KEYS (SELF-STEAL)
+# ============================================================
+
+read_inbound_name() {
+    echo
+    read -r -p "Введите название инбаунда: " INBOUND_NAME
+    INBOUND_NAME="${INBOUND_NAME:-Reality}"
+    log "Название инбаунда: VLESS-Reality-${INBOUND_NAME}"
+}
+
+generate_selfsteal_keys() {
+    log "Генерация X25519..."
+
+    local x25519_output
+    x25519_output="$(
+        docker exec "${CONTAINER_NAME}" xray x25519
+    )" || die "Не удалось сгенерировать X25519."
+
+    PRIVATE_KEY="$(
+        printf '%s\n' "${x25519_output}" |
+        awk -F': *' '/^PrivateKey/ {print $2; exit}' |
+        tr -d '[:space:]'
+    )"
+
+    [[ -n "${PRIVATE_KEY}" ]] ||
+        die "Не удалось извлечь PrivateKey из вывода xray x25519."
+
+    SHORT_ID="$(openssl rand -hex 8)"
+
+    log "Ключи сгенерированы."
+}
+
+build_selfsteal_profile() {
+    log "Сборка профиля..."
+
+    INBOUND_NAME="${INBOUND_NAME}" \
+    SITE_DOMAIN="${SITE_DOMAIN}" \
+    PRIVATE_KEY="${PRIVATE_KEY}" \
+    SHORT_ID="${SHORT_ID}" \
+    PROFILE_FILE="${PROFILE_FILE}" \
+    python3 - <<'PY'
+import json
+import os
+
+profile = {
+    "log": {
+        "loglevel": "warning"
+    },
+    "dns": {
+        "servers": ["1.1.1.1", "1.0.0.1"],
+        "queryStrategy": "UseIPv4"
+    },
+    "inbounds": [
+        {
+            "tag": "VLESS-Reality-" + os.environ["INBOUND_NAME"],
+            "port": 443,
+            "listen": "0.0.0.0",
+            "protocol": "vless",
+            "settings": {
+                "clients": [],
+                "decryption": "none"
+            },
+            "sniffing": {
+                "enabled": True,
+                "destOverride": ["http", "tls", "quic"]
+            },
+            "streamSettings": {
+                "network": "raw",
+                "security": "reality",
+                "realitySettings": {
+                    "dest": "127.0.0.1:8443",
+                    "show": False,
+                    "xver": 0,
+                    "shortIds": [os.environ["SHORT_ID"]],
+                    "privateKey": os.environ["PRIVATE_KEY"],
+                    "fingerprint": "firefox",
+                    "serverNames": [os.environ["SITE_DOMAIN"]]
+                }
+            }
+        }
+    ],
+    "outbounds": [
+        {
+            "tag": "DIRECT",
+            "protocol": "freedom"
+        },
+        {
+            "tag": "BLOCK",
+            "protocol": "blackhole"
+        }
+    ],
+    "routing": {
+        "rules": [
+            {
+                "ip": ["geoip:private"],
+                "type": "field",
+                "outboundTag": "BLOCK"
+            },
+            {
+                "type": "field",
+                "protocol": ["bittorrent"],
+                "outboundTag": "BLOCK"
+            }
+        ],
+        "domainStrategy": "IPIfNonMatch"
+    }
+}
+
+path = os.environ["PROFILE_FILE"]
+fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+with os.fdopen(fd, "w", encoding="utf-8") as f:
+    json.dump(profile, f, ensure_ascii=False, indent=2)
+    f.write("\n")
+PY
+
+    log "Профиль сохранён в ${PROFILE_FILE} (права 600)."
+}
+
+show_selfsteal_profile() {
+    echo
+    echo "========================================"
+    echo "          PROFILE FOR REMNAWAVE"
+    echo "========================================"
+    echo
+    cat "${PROFILE_FILE}"
+    echo
+    warn "Профиль содержит приватный ключ. Не публикуйте его."
+    echo "========================================"
+}
+
+configure_selfsteal_profile() {
+    read_inbound_name
+    generate_selfsteal_keys
+    build_selfsteal_profile
+    show_selfsteal_profile
+}
+
+# ============================================================
+# GENERATE PARAMETERS (WITHOUT SELF-STEAL)
 # ============================================================
 
 generate_parameters() {
@@ -1046,13 +1375,18 @@ show_result() {
     echo
 
     log "Remnawave Node установлен."
+    log "Режим: $( (( SELFSTEAL == 1 )) && echo 'с self-steal' || echo 'без self-steal' )"
     log "Docker перезапущен: ${DOCKER_RESTARTED}"
     log "Docker logging: $(docker info --format '{{.LoggingDriver}}')"
     log "Docker limits: проверены"
     log "Container: ${CONTAINER_NAME}"
     log "Image: ${IMAGE}"
     log "Install directory: ${INSTALL_DIR}"
-    log "Сайт: ${SITE_DOMAIN} (${SITE_ROOT})"
+
+    if (( SELFSTEAL == 1 )); then
+        log "Домен self-steal: ${SITE_DOMAIN}"
+        log "Nginx: ${NGINX_VERSION}"
+    fi
 
     if [[ -n "${MAIN_INTERFACE}" ]]; then
         echo
@@ -1065,7 +1399,6 @@ show_result() {
     echo "Docker daemon config: ${DOCKER_DAEMON_JSON}"
     echo "Docker systemd limits: ${DOCKER_DROPIN}"
     echo "Journald config: ${JOURNALD_DROPIN}"
-    echo "Site backups: ${SITE_BACKUP_DIR}"
     echo
     echo "========================================"
 }
@@ -1082,16 +1415,16 @@ main() {
 
     select_mode
 
-    if [[ "${MODE}" == "1" ]]; then
+    if (( REINSTALL == 0 )); then
         if [[ -d "${INSTALL_DIR}" ]] || docker_container_exists; then
-            die "Обнаружена существующая установка. Выберите переустановку."
+            die "Обнаружена существующая установка. Выберите пункт 3 для переустановки."
         fi
     fi
 
     install_packages
     install_docker
 
-    if [[ "${MODE}" == "2" ]]; then
+    if (( REINSTALL == 1 )); then
         remove_remnanode
     fi
 
@@ -1118,11 +1451,12 @@ main() {
     create_configuration
     start_node
 
-    # Сайт устанавливается до генерации параметров профиля.
-    configure_site
-
-    # Ключи генерируются только после успешной установки сайта и запуска Node.
-    generate_parameters
+    if (( SELFSTEAL == 1 )); then
+        configure_selfsteal
+        configure_selfsteal_profile
+    else
+        generate_parameters
+    fi
 
     show_result
 }
