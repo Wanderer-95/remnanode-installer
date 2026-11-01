@@ -1,9 +1,8 @@
-
 #!/usr/bin/env bash
 
 set -Eeuo pipefail
 
-VERSION="1.2.0"
+VERSION="1.3.0"
 
 INSTALL_DIR="/opt/remnanode"
 CONTAINER_NAME="remnanode"
@@ -17,10 +16,15 @@ DOCKER_DROPIN="/etc/systemd/system/docker.service.d/99-remnanode-limits.conf"
 DOCKER_DAEMON_JSON="/etc/docker/daemon.json"
 JOURNALD_DROPIN="/etc/systemd/journald.conf.d/99-remnanode.conf"
 
+SITE_ROOT="/var/www/html"
+SITE_BACKUP_DIR="/var/backups/remnanode-site"
+
 BACKUP_SUFFIX="$(date +%Y%m%d-%H%M%S)"
 DOCKER_RESTARTED=0
 MAIN_INTERFACE=""
 EXISTING_SECRET_KEY=""
+SITE_DOMAIN=""
+SITE_TMP_SCRIPT=""
 
 # ============================================================
 # COLORS AND LOGGING
@@ -211,7 +215,8 @@ install_packages() {
         iproute2 \
         iptables \
         kmod \
-        ufw
+        ufw \
+        nginx
 
     log "Необходимые пакеты установлены."
 }
@@ -834,6 +839,170 @@ start_node() {
 }
 
 # ============================================================
+# SITE INSTALLATION (CTRL+D INPUT)
+# ============================================================
+
+ask_site_domain() {
+    local domain
+
+    while true; do
+        echo
+        read -r -p "Введите домен сайта (например, example.com): " domain
+        domain="${domain,,}"
+
+        if [[ "${domain}" =~ ^([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}$ ]]; then
+            SITE_DOMAIN="${domain}"
+            log "Домен сайта: ${SITE_DOMAIN}"
+            return 0
+        fi
+
+        warn "Некорректный домен. Попробуйте снова."
+    done
+}
+
+read_site_script() {
+    echo
+    info "Вставьте Bash-скрипт сайта целиком."
+    info "Затем на новой пустой строке нажмите Ctrl+D."
+    echo
+
+    SITE_TMP_SCRIPT="$(mktemp /tmp/remnanode-site.XXXXXX.sh)"
+    chmod 600 "${SITE_TMP_SCRIPT}"
+
+    cat > "${SITE_TMP_SCRIPT}"
+
+    [[ -s "${SITE_TMP_SCRIPT}" ]] ||
+        die "Скрипт сайта пустой."
+
+    log "Скрипт сайта получен: $(wc -l < "${SITE_TMP_SCRIPT}") строк."
+}
+
+prepare_site_script() {
+    log "Подготовка скрипта сайта..."
+
+    SITE_DOMAIN="${SITE_DOMAIN}" SITE_TMP="${SITE_TMP_SCRIPT}" python3 - <<'PY'
+import os
+
+path = os.environ["SITE_TMP"]
+domain = os.environ["SITE_DOMAIN"]
+
+with open(path, "r", encoding="utf-8") as f:
+    text = f.read()
+
+text = text.replace("/var/www/selfsteal", "/var/www/html")
+text = text.replace("greenhabitat.info", domain)
+
+with open(path, "w", encoding="utf-8") as f:
+    f.write(text)
+PY
+
+    log "Путь заменён на /var/www/html, домен заменён на ${SITE_DOMAIN}."
+}
+
+backup_site() {
+    mkdir -p "${SITE_ROOT}"
+    mkdir -p "${SITE_BACKUP_DIR}"
+    chmod 700 "${SITE_BACKUP_DIR}"
+
+    if [[ -n "$(ls -A "${SITE_ROOT}" 2>/dev/null)" ]]; then
+        local backup="${SITE_BACKUP_DIR}/site-${BACKUP_SUFFIX}.tar.gz"
+
+        tar -czf "${backup}" -C "${SITE_ROOT}" .
+        log "Резервная копия предыдущего сайта: ${backup}"
+
+        find "${SITE_ROOT}" -mindepth 1 -delete
+        log "Содержимое ${SITE_ROOT} очищено перед установкой."
+    else
+        info "Предыдущий сайт не найден."
+    fi
+}
+
+run_site_generator() {
+    log "Запуск генератора сайта..."
+
+    # Скрипт выполняется отдельным процессом, не через eval.
+    bash "${SITE_TMP_SCRIPT}" ||
+        die "Генератор сайта завершился с ошибкой. Профиль не создан."
+
+    rm -f "${SITE_TMP_SCRIPT}"
+
+    log "Генератор сайта выполнен."
+}
+
+verify_site_files() {
+    log "Проверка файлов сайта..."
+
+    [[ -f "${SITE_ROOT}/index.html" ]] ||
+        die "Не найден index.html в ${SITE_ROOT}."
+
+    [[ -n "$(find "${SITE_ROOT}" -type f -name '*.css' -print -quit)" ]] ||
+        die "Не найден CSS-файл в ${SITE_ROOT}."
+
+    [[ -n "$(find "${SITE_ROOT}" -type f -name '*.js' -print -quit)" ]] ||
+        die "Не найден JavaScript-файл в ${SITE_ROOT}."
+
+    log "Найдены index.html, CSS и JavaScript."
+}
+
+set_site_permissions() {
+    log "Настройка прав доступа к сайту..."
+
+    chown -R www-data:www-data "${SITE_ROOT}"
+    find "${SITE_ROOT}" -type d -exec chmod 755 {} +
+    find "${SITE_ROOT}" -type f -exec chmod 644 {} +
+
+    log "Права доступа установлены."
+}
+
+verify_site_nginx() {
+    log "Проверка сайта через Nginx..."
+
+    systemctl enable nginx >/dev/null 2>&1 || true
+
+    nginx -t ||
+        die "Конфигурация Nginx не прошла проверку."
+
+    if systemctl is-active --quiet nginx; then
+        systemctl reload nginx
+    else
+        systemctl start nginx
+    fi
+
+    systemctl is-active --quiet nginx ||
+        die "Nginx не запущен."
+
+    local http_code
+    http_code="$(
+        curl -s -o /dev/null -w '%{http_code}' \
+            -H "Host: ${SITE_DOMAIN}" \
+            http://127.0.0.1/ || true
+    )"
+
+    echo "HTTP-код локальной проверки: ${http_code}"
+
+    [[ "${http_code}" == "200" ]] ||
+        die "Сайт не отвечает с кодом 200 через Nginx."
+
+    log "Сайт отвечает через Nginx."
+}
+
+configure_site() {
+    echo
+    log "Установка сайта-маскировки..."
+
+    ask_site_domain
+    read_site_script
+    prepare_site_script
+    backup_site
+    run_site_generator
+    verify_site_files
+    set_site_permissions
+    verify_site_nginx
+
+    log "Сайт ${SITE_DOMAIN} установлен."
+}
+
+# ============================================================
 # GENERATE PARAMETERS
 # ============================================================
 
@@ -883,6 +1052,7 @@ show_result() {
     log "Container: ${CONTAINER_NAME}"
     log "Image: ${IMAGE}"
     log "Install directory: ${INSTALL_DIR}"
+    log "Сайт: ${SITE_DOMAIN} (${SITE_ROOT})"
 
     if [[ -n "${MAIN_INTERFACE}" ]]; then
         echo
@@ -895,6 +1065,7 @@ show_result() {
     echo "Docker daemon config: ${DOCKER_DAEMON_JSON}"
     echo "Docker systemd limits: ${DOCKER_DROPIN}"
     echo "Journald config: ${JOURNALD_DROPIN}"
+    echo "Site backups: ${SITE_BACKUP_DIR}"
     echo
     echo "========================================"
 }
@@ -947,7 +1118,10 @@ main() {
     create_configuration
     start_node
 
-    # Ключи генерируются только после успешного запуска Node.
+    # Сайт устанавливается до генерации параметров профиля.
+    configure_site
+
+    # Ключи генерируются только после успешной установки сайта и запуска Node.
     generate_parameters
 
     show_result
