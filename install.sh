@@ -22,7 +22,7 @@ NGINX_KEYRING="/usr/share/keyrings/nginx-archive-keyring.gpg"
 NGINX_REPO_LIST="/etc/apt/sources.list.d/nginx.list"
 NGINX_PIN="/etc/apt/preferences.d/99-nginx-org"
 SITE_ROOT="/var/www/html"
-PROFILE_FILE="/root/remnanode-profile.json"
+PROFILE_FILE=""
 
 BACKUP_SUFFIX="$(date +%Y%m%d-%H%M%S)"
 DOCKER_RESTARTED=0
@@ -1350,12 +1350,12 @@ generate_selfsteal_keys() {
 build_selfsteal_profile() {
     log "Сборка профиля..."
 
-    INBOUND_NAME="${INBOUND_NAME}" \
-    SITE_DOMAIN="${SITE_DOMAIN}" \
-    PRIVATE_KEY="${PRIVATE_KEY}" \
-    SHORT_ID="${SHORT_ID}" \
-    PROFILE_FILE="${PROFILE_FILE}" \
-    python3 - <<'PY'
+    PROFILE_JSON="$(
+        INBOUND_NAME="${INBOUND_NAME}" \
+        SITE_DOMAIN="${SITE_DOMAIN}" \
+        PRIVATE_KEY="${PRIVATE_KEY}" \
+        SHORT_ID="${SHORT_ID}" \
+        python3 - <<'PY'
 import json
 import os
 
@@ -1423,14 +1423,13 @@ profile = {
     }
 }
 
-path = os.environ["PROFILE_FILE"]
-fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-with os.fdopen(fd, "w", encoding="utf-8") as f:
-    json.dump(profile, f, ensure_ascii=False, indent=2)
-    f.write("\n")
+print(json.dumps(profile, ensure_ascii=False, indent=2))
 PY
+    )"
 
-    log "Профиль сохранён в ${PROFILE_FILE} (права 600)."
+    [[ -n "${PROFILE_JSON}" ]] || die "Не удалось собрать профиль."
+
+    log "Профиль собран."
 }
 
 show_selfsteal_profile() {
@@ -1439,10 +1438,14 @@ show_selfsteal_profile() {
     echo "          PROFILE FOR REMNAWAVE"
     echo "========================================"
     echo
-    cat "${PROFILE_FILE}"
+    printf '%s\n' "${PROFILE_JSON}"
     echo
-    warn "Профиль содержит приватный ключ. Не публикуйте его."
+    warn "Профиль содержит приватный ключ. Скопируйте его и не публикуйте."
+    echo "Файл не сохранён на диске."
     echo "========================================"
+
+    # Очищаем переменную, чтобы ключ не оставался в памяти скрипта.
+    PROFILE_JSON=""
 }
 
 configure_selfsteal_profile() {
