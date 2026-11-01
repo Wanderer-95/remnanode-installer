@@ -1226,8 +1226,7 @@ check_site_placeholder() {
 install_site() {
     echo
     info "Вставьте сайт целиком."
-    info "Если это HTML-страница, вставьте её как есть."
-    info "Если это Bash-скрипт генератора, вставьте его целиком."
+    info "Для HTML вставьте страницу, для генератора вставьте Bash-скрипт целиком."
     info "Затем на новой пустой строке нажмите Ctrl+D."
     echo
 
@@ -1241,11 +1240,12 @@ install_site() {
 
     mkdir -p "${SITE_ROOT}"
 
-    if grep -qiE '<!doctype html|<html' "${tmp_site}"; then
-        cp "${tmp_site}" "${SITE_ROOT}/index.html"
-        log "HTML-страница сохранена как index.html."
-    else
-        log "Выполнение скрипта сайта..."
+    # Первая непустая строка: shebang означает Bash-скрипт генератора.
+    local first_line
+    first_line="$(sed -n '/[^[:space:]]/{p;q;}' "${tmp_site}")"
+
+    if [[ "${first_line}" == '#!'* ]]; then
+        log "Обнаружен Bash-скрипт генератора. Выполнение..."
 
         SITE_DOMAIN="${SITE_DOMAIN}" SITE_TMP="${tmp_site}" python3 - <<'PY'
 import os
@@ -1263,7 +1263,16 @@ with open(path, "w", encoding="utf-8") as f:
     f.write(text)
 PY
 
-        bash "${tmp_site}" || die "Скрипт сайта завершился с ошибкой."
+        # Передаём целевую папку, иначе генератор создаст chashka-site в текущем каталоге.
+        bash "${tmp_site}" "${SITE_ROOT}" || die "Генератор сайта завершился с ошибкой."
+
+    elif grep -qiE '<!doctype html|<html' "${tmp_site}"; then
+        cp "${tmp_site}" "${SITE_ROOT}/index.html"
+        log "HTML-страница сохранена как index.html."
+
+    else
+        rm -f "${tmp_site}"
+        die "Не удалось распознать сайт: нет shebang и HTML-тегов."
     fi
 
     rm -f "${tmp_site}"
