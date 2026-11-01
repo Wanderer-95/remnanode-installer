@@ -1037,7 +1037,7 @@ ask_selfsteal_domain() {
         if [[ "${domain}" =~ ^([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}$ ]]; then
             SITE_DOMAIN="${domain}"
             log "Домен: ${SITE_DOMAIN}"
-            info "Домен должен already указывать A-записью на IP этого сервера."
+            info "Домен должен указывать A-записью на IP этого сервера."
             return 0
         fi
 
