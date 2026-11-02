@@ -1264,7 +1264,28 @@ with open(path, "w", encoding="utf-8") as f:
 PY
 
         # Передаём целевую папку, иначе генератор создаст chashka-site в текущем каталоге.
-        bash "${tmp_site}" "${SITE_ROOT}" || die "Генератор сайта завершился с ошибкой."
+                bash "${tmp_site}" "${SITE_ROOT}" || die "Генератор сайта завершился с ошибкой."
+
+        # Некоторые генераторы игнорируют аргумент и пишут в свою папку.
+        if [[ ! -f "${SITE_ROOT}/index.html" ]]; then
+            local found_index
+            found_index="$(
+                find /var/www -maxdepth 2 -name index.html -newer "${tmp_site}" \
+                    -not -path "${SITE_ROOT}/*" 2>/dev/null |
+                head -n 1 || true
+            )"
+
+            if [[ -n "${found_index}" ]]; then
+                local found_dir
+                found_dir="$(dirname "${found_index}")"
+
+                log "Генератор записал сайт в ${found_dir}. Копируем в ${SITE_ROOT}."
+                find "${SITE_ROOT}" -mindepth 1 -delete
+                cp -a "${found_dir}/." "${SITE_ROOT}/"
+            else
+                warn "Генератор не создал index.html ни в ${SITE_ROOT}, ни в /var/www/*."
+            fi
+        fi
 
     elif grep -qiE '<!doctype html|<html' "${tmp_site}"; then
         cp "${tmp_site}" "${SITE_ROOT}/index.html"
