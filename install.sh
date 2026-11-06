@@ -1,11 +1,13 @@
 #!/usr/bin/env bash
 #
 # Remnawave Node installer
-# Режимы: 1) без self-steal  2) с self-steal  3) каскад RU -> EU  4) переустановка  5) продолжить каскад
+# Режимы: 1) без self-steal  2) с self-steal  3) каскад RU -> EU
+#         4) переустановка ноды  5) продолжить каскад RU -> EU
+#         6) доделать self-steal (сайт и nginx) без переустановки ноды
 #
 set -Eeuo pipefail
 
-INSTALLER_VERSION="1.11.0"
+INSTALLER_VERSION="1.12.0"
 INSTALLER_URL="https://raw.githubusercontent.com/Wanderer-95/remnanode-installer/main/install.sh"
 
 export DEBIAN_FRONTEND=noninteractive
@@ -28,6 +30,7 @@ JOURNALD_DROPIN="/etc/systemd/journald.conf.d/99-remnanode.conf"
 
 NGINX_CONF="/etc/nginx/conf.d/remnanode-selfsteal.conf"
 NGINX_PREBACKUP="${NGINX_CONF}.pre-remnanode"
+NGINX_PREV="/root/remnanode-backups/remnanode-selfsteal.conf.prev"
 NGINX_BACKUP_DIR="/root/remnanode-backups"
 SITE_ROOT_BASE="/var/www/remnanode-selfsteal"
 SITE_ROOT="${SITE_ROOT_BASE}"
@@ -57,6 +60,7 @@ NAME_RE='^[A-Za-z0-9_-]{1,32}$'
 MENU_ACTION=""
 REINSTALL=0
 RESUME=0
+RESUME_SITE=0
 REINSTALL_TYPE=""
 CONFIRM_DELETE=""
 SELFSTEAL=0
@@ -72,7 +76,6 @@ PASTE_TMP=""
 NGINX_VERSION=""
 
 WORK_DIR=""
-NGINX_SNAPSHOT=""
 SITE_SOURCE_DIR=""
 
 PRIVATE_KEY=""
@@ -189,6 +192,7 @@ check_system() {
     . /etc/os-release
 
     [[ "${ID:-}" == "ubuntu" ]] || die "Поддерживается только Ubuntu."
+    command -v python3 >/dev/null 2>&1 || die "Не найден python3. Установите: apt-get install -y python3"
 
     if [[ "${VERSION_ID:-}" != "24.04" ]]; then
         warn "Рекомендуется Ubuntu 24.04. Текущая версия: ${VERSION_ID:-unknown}"
@@ -221,7 +225,7 @@ select_reinstall() {
     ask REINSTALL_TYPE "Выберите тип [1/2/3]: "
     apply_type "${REINSTALL_TYPE}"
 
-    warn "Будет удалён текущий Remnawave Node и незавершённый каскад (если был)."
+    warn "Будет удалён текущий Remnawave Node и незавершённый каскад (если был))."
     warn "Docker, SSH, UFW и остальные контейнеры сохраняются."
     ask CONFIRM_DELETE "Для подтверждения введите DELETE: "
     [[ "${CONFIRM_DELETE}" == "DELETE" ]] || die "Операция отменена."
@@ -241,6 +245,9 @@ select_mode() {
     if [[ -f "${CASCADE_STATE_FILE}" ]]; then
         echo "5) Продолжить каскад RU -> EU (ввести PublicKey и Short ID с EU)"
     fi
+    if docker_container_exists; then
+        echo "6) Доделать self-steal (сайт и nginx) без переустановки ноды"
+    fi
     echo "0) Выход"
     echo
 
@@ -257,6 +264,10 @@ select_mode() {
         5)
             [[ -f "${CASCADE_STATE_FILE}" ]] || die "Нет сохранённого состояния каскада."
             RESUME=1
+            ;;
+        6)
+            docker_container_exists || die "Нода не найдена. Выберите пункт 1, 2 или 3."
+            RESUME_SITE=1
             ;;
         0)
             exit 0
@@ -325,7 +336,7 @@ read_secret_key() {
     log "SECRET_KEY принят."
 }
 
-# Проверяет, что домен указывает на этот сервер. Только предупреждает, не блокирует.
+# Проверяет, что домен указывает на этот сервер. Только предупреждает, кроме случая неразрешимого домена.
 check_dns_points_here() {
     local domain="$1" dns_ip="" my_ip=""
 
@@ -354,6 +365,162 @@ ask_selfsteal_domain() {
     check_dns_points_here "${SITE_DOMAIN}"
 }
 
+# Приводит файл к виду без BOM и без CRLF (на месте).
+normalize_site_file() {
+    local file="$1"
+    python3 - "${file}" <<'PY'
+import sys
+
+path = sys.argv[1]
+with open(path, "rb") as f:
+    data = f.read()
+if data.startswith(b"\xef\xbb\xbf"):
+    data = data[3:]
+data = data.replace(b"\r\n", b"\n")
+with open(path, "wb") as f:
+    f.write(data)
+PY
+    chmod 600 "${file}"
+}
+
+# Печатает тип файла: bash, html, unsupported-shebang или unknown.
+detect_site_kind() {
+    local file="$1" first=""
+    first="$(sed -n '/[^[:space:]]/{p;q;}' "${file}")"
+
+    if [[ "${first}" == '#!'* ]]; then
+        if [[ "${first}" =~ ^#!.*(bash|/sh)([[:space:]]|$) ]]; then
+            echo "bash"
+        else
+            echo "unsupported-shebang"
+        fi
+        return 0
+    fi
+
+    if [[ "${first}" =~ ^[[:space:]]*\< ]] &&
+       grep -qiE '<!doctype[[:space:]]+html|<html|<head|<body' "${file}"; then
+        echo "html"
+        return 0
+    fi
+
+    echo "unknown"
+}
+
+# Ищет в bash-генераторе встроенные Python-блоки (<<'PY' ... PY) и проверяет их синтаксис.
+# Ошибка показывается сразу, до того как что-либо будет изменено на сервере.
+check_embedded_python() {
+    local file="$1"
+    python3 - "${file}" <<'PYCHK' || return 1
+import ast
+import re
+import sys
+
+path = sys.argv[1]
+with open(path, encoding="utf-8", errors="replace") as f:
+    lines = f.read().split("\n")
+
+start_re = re.compile(r"<<-?\s*(['\"]?)PY\1\s*$")
+end_re = re.compile(r"^\s*PY\s*$")
+
+errors = []
+blocks = []
+i = 0
+while i < len(lines):
+    if start_re.search(lines[i]):
+        begin = i + 1
+        j = begin
+        while j < len(lines) and not end_re.match(lines[j]):
+            j += 1
+        if j >= len(lines):
+            errors.append(f"строка {i + 1}: блок <<'PY' не закрыт строкой PY")
+            break
+        blocks.append((begin, lines[begin:j]))
+        i = j + 1
+        continue
+    i += 1
+
+for begin, body in blocks:
+    code = "\n".join(body) + "\n"
+    try:
+        ast.parse(code, filename=path)
+    except SyntaxError as e:
+        # Номер строки в блоке (1-based) -> номер строки в файле: begin + lineno.
+        ln = begin + (e.lineno or 1)
+        text = lines[ln - 1].strip() if 0 < ln <= len(lines) else ""
+        errors.append(f"строка {ln}: {e.msg}\n      {text}")
+
+if errors:
+    print("Ошибки во встроенном Python-коде генератора:", file=sys.stderr)
+    for err in errors:
+        print("    " + err, file=sys.stderr)
+    sys.exit(1)
+
+print(f"    Python-блоков проверено: {len(blocks)}, ошибок нет.")
+PYCHK
+}
+
+# Предупреждения о типичных проблемах генератора. Не блокируют установку.
+warn_generator_style() {
+    local file="$1"
+
+    if grep -qE '^[[:space:]]*(read|select)[[:space:]]' "${file}"; then
+        warn "В генераторе есть интерактивный ввод (read/select). Ввода не будет: возможна ошибка или зависание."
+    fi
+
+    if grep -qE 'apt(-get)?[[:space:]]+install' "${file}" &&
+       grep -E 'apt(-get)?[[:space:]]+install' "${file}" | grep -qvE -- '(-y|--yes|assume-yes)'; then
+        warn "В генераторе есть 'apt install' без -y: установка может ждать ответа и зависнуть."
+    fi
+
+    if grep -qE '/var/www/|/usr/share/nginx' "${file}" &&
+       ! grep -qE '\$1|\$\{1|OUT_DIR|SITE_OUT|WEB_ROOT|SITE_ROOT' "${file}"; then
+        warn "Генератор пишет в фиксированный путь и не использует \$1 / OUT_DIR. Установщик попробует найти сайт сам,"
+        warn "но надёжнее писать в каталог из первого аргумента: ROOT=\"\${1:-/var/www/\${DOMAIN}}\"."
+    fi
+
+    if grep -qE 'nginx|certbot|ufw|systemctl|apache' "${file}"; then
+        info "Генератор упоминает веб-сервер или фаервол: эти команды будут подменены, а изменения nginx откатятся."
+    fi
+}
+
+# Полная проверка вставленного сайта. Возвращает 0 только если сайт годится для установки.
+validate_site_input() {
+    local file="$1" kind="" out=""
+
+    [[ -s "${file}" ]] || { warn "Сайт пустой."; return 1; }
+
+    normalize_site_file "${file}"
+    kind="$(detect_site_kind "${file}")"
+
+    case "${kind}" in
+        html)
+            log "Обнаружена HTML-страница."
+            ;;
+        bash)
+            log "Обнаружен bash-генератор. Проверяем его до начала установки..."
+            if ! out="$(bash -n "${file}" 2>&1)"; then
+                warn "Синтаксическая ошибка в bash-генераторе:"
+                printf '%s\n' "${out}" | sed 's/^/    /' >&2
+                return 1
+            fi
+            if ! check_embedded_python "${file}"; then
+                return 1
+            fi
+            warn_generator_style "${file}"
+            log "Генератор прошёл проверку."
+            ;;
+        unsupported-shebang)
+            warn "Первая строка задаёт не bash и не sh. Поддерживаются HTML и bash-генератор (#!/bin/bash)."
+            return 1
+            ;;
+        *)
+            warn "Не удалось распознать сайт. Нужен HTML (с <!DOCTYPE html> или <html>) или bash-генератор с первой строкой #!/bin/bash."
+            return 1
+            ;;
+    esac
+    return 0
+}
+
 collect_site() {
     echo
     info "Сайт-заглушку можно передать двумя способами:"
@@ -362,14 +529,23 @@ collect_site() {
     info "Генератор запускается от root без ввода с клавиатуры и может сам ставить пакеты."
     info "Сайт нужно записать в каталог из первого аргумента \$1 (также доступен в OUT_DIR, SITE_ROOT, WEB_ROOT)."
     info "Генератор не должен настраивать nginx, firewall и сертификаты: это делает установщик."
-    info "Если генератор положит сайт в другое место (например /var/www/html), установщик найдёт его сам."
+    info "Сайт проверяется сразу после вставки. Если найдена ошибка, его можно вставить заново."
     info "Вставьте сайт целиком, затем на новой строке нажмите Ctrl+D."
 
-    PASTE_TMP="$(mktemp /tmp/remnanode-site.XXXXXX)"
-    chmod 600 "${PASTE_TMP}"
-    cat > "${PASTE_TMP}"
-    [[ -s "${PASTE_TMP}" ]] || die "Сайт пустой."
-    SITE_FILE="${PASTE_TMP}"
+    while true; do
+        PASTE_TMP="$(mktemp /tmp/remnanode-site.XXXXXX)"
+        chmod 600 "${PASTE_TMP}"
+        cat > "${PASTE_TMP}"
+
+        if validate_site_input "${PASTE_TMP}"; then
+            SITE_FILE="${PASTE_TMP}"
+            return 0
+        fi
+
+        warn "Сайт не принят. Исправьте ошибку в генераторе или HTML."
+        confirm_continue "Вставить сайт заново? [y/N]: "
+        rm -f "${PASTE_TMP}"
+    done
 }
 
 ask_restart_if_needed() {
@@ -456,7 +632,7 @@ remove_remnanode() {
     else
         rm -f -- "${NGINX_CONF}"
     fi
-    rm -f -- "${CASCADE_STATE_FILE}" "${LEGACY_PROFILE_FILE}"
+    rm -f -- "${NGINX_PREV}" "${CASCADE_STATE_FILE}" "${LEGACY_PROFILE_FILE}"
 
     local hook="/etc/letsencrypt/renewal-hooks/deploy/remnanode-selfsteal-reload-nginx.sh"
     local hook_backup=""
@@ -470,9 +646,9 @@ remove_remnanode() {
         rm -f -- "${hook}"
     fi
 
-    if systemctl is-active --quiet nginx; then
+    if "${REAL_SYSTEMCTL}" is-active --quiet nginx; then
         if nginx -t >/dev/null 2>&1; then
-            systemctl reload nginx || warn "Nginx не перезагружен."
+            "${REAL_SYSTEMCTL}" reload nginx || warn "Nginx не перезагружен."
         else
             warn "Конфигурация nginx не проходит проверку после удаления. Проверьте её вручную."
         fi
@@ -563,6 +739,43 @@ install_docker() {
     fi
     docker compose version >/dev/null 2>&1 || die "Docker Compose не найден после установки."
     log "Docker и Docker Compose доступны."
+}
+
+# ============================================================
+# PORTS (ДО ИЗМЕНЕНИЙ)
+# ============================================================
+
+# Список процессов, слушающих 80, 443 и 8443: "порт процесс".
+listener_owners() {
+    ss -H -tlnp 2>/dev/null | awk '
+        {
+            n = split($4, a, ":"); port = a[n]
+            if (port != "80" && port != "443" && port != "8443") next
+            proc = "?"
+            if (match($0, /"[^"]+"/)) proc = substr($0, RSTART + 1, RLENGTH - 2)
+            print port, proc
+        }'
+}
+
+# Проверяет порты до установки. 443 занимает Xray внутри ноды (rw-core), это штатно.
+# 80 и 8443 нужны только для self-steal.
+preflight_ports() {
+    local port proc bad=""
+    while read -r port proc; do
+        [[ -n "${port}" ]] || continue
+        case "${port}" in
+            443) ;;
+            80|8443) (( SELFSTEAL == 1 )) || continue ;;
+            *) continue ;;
+        esac
+        case "${port}:${proc}" in
+            80:nginx|8443:nginx|443:rw-core|443:xray|443:docker-proxy) ;;
+            *) bad+="${port} (${proc}) " ;;
+        esac
+    done < <(listener_owners)
+
+    [[ -z "${bad}" ]] || die "Порты заняты посторонними процессами: ${bad}. Освободите их и запустите установку заново."
+    log "Порты проверены."
 }
 
 # ============================================================
@@ -930,7 +1143,7 @@ EOF
 start_node() {
     log "Загрузка образа и запуск Remnawave Node..."
     cd "${INSTALL_DIR}"
-    docker compose pull
+    docker compose pull || die "Не удалось загрузить образ ${IMAGE}. Проверьте доступ к Docker Hub."
     docker compose up -d
 
     local i status
@@ -947,8 +1160,7 @@ start_node() {
     die "Remnawave Node не запустился."
 }
 
-# Генерирует ключи Reality один раз для всех режимов.
-# В образе бинарник может называться xray или rw-core, пробуем оба.
+# Генерирует ключи Reality. В образе бинарник может называться xray или rw-core, пробуем оба.
 generate_keys() {
     log "Генерация ключей Reality (X25519)..."
 
@@ -1037,9 +1249,8 @@ check_nginx_domain_conflicts() {
 
 # Возвращает предыдущую версию нашего конфига (или удаляет его, если предыдущей не было).
 restore_prev_nginx_conf() {
-    local prev="${NGINX_BACKUP_DIR}/remnanode-selfsteal.conf.prev"
-    if [[ -f "${prev}" ]]; then
-        cp -a "${prev}" "${NGINX_CONF}"
+    if [[ -f "${NGINX_PREV}" ]]; then
+        cp -a "${NGINX_PREV}" "${NGINX_CONF}"
     else
         rm -f "${NGINX_CONF}"
     fi
@@ -1048,7 +1259,6 @@ restore_prev_nginx_conf() {
 write_nginx_config() {
     local stage="$1"
     local tmp="${NGINX_CONF}.new.$$"
-    local prev="${NGINX_BACKUP_DIR}/remnanode-selfsteal.conf.prev"
 
     mkdir -p /etc/nginx/conf.d "${NGINX_BACKUP_DIR}"
     chmod 700 "${NGINX_BACKUP_DIR}"
@@ -1061,6 +1271,7 @@ server {
     server_name _DOMAIN_;
     root _SITE_ROOT_;
     index index.html;
+    server_tokens off;
 
     location ^~ /.well-known/acme-challenge/ {
         try_files $uri =404;
@@ -1078,6 +1289,7 @@ server {
     listen [::]:80;
     server_name _DOMAIN_;
     root _SITE_ROOT_;
+    server_tokens off;
 
     location ^~ /.well-known/acme-challenge/ {
         try_files $uri =404;
@@ -1088,22 +1300,31 @@ server {
     }
 }
 
+# Внутренний HTTPS-сервер, на него смотрит Reality (dest). Слушает только localhost.
 server {
     listen 127.0.0.1:8443 ssl http2;
     server_name _DOMAIN_;
+    server_tokens off;
 
     ssl_certificate     /etc/letsencrypt/live/_DOMAIN_/fullchain.pem;
     ssl_certificate_key /etc/letsencrypt/live/_DOMAIN_/privkey.pem;
     ssl_protocols TLSv1.2 TLSv1.3;
-    ssl_session_cache shared:SSL:10m;
+    ssl_prefer_server_ciphers off;
+    ssl_session_cache shared:remnanode_ssl:10m;
     ssl_session_timeout 1d;
+    ssl_session_tickets off;
 
     root _SITE_ROOT_;
     index index.html;
+    charset utf-8;
     add_header X-Content-Type-Options nosniff always;
 
     location / {
         try_files $uri $uri/ =404;
+    }
+
+    location ~ /\. {
+        deny all;
     }
 }
 NGINX
@@ -1116,14 +1337,14 @@ NGINX
     chmod 644 "${tmp}"
 
     if [[ -f "${NGINX_CONF}" ]]; then
-        cp -a "${NGINX_CONF}" "${prev}"
+        cp -a "${NGINX_CONF}" "${NGINX_PREV}"
         cp -a "${NGINX_CONF}" "${NGINX_BACKUP_DIR}/remnanode-selfsteal.conf.bak.${BACKUP_SUFFIX}"
         if [[ ! -e "${NGINX_PREBACKUP}" ]]; then
             cp -a "${NGINX_CONF}" "${NGINX_PREBACKUP}"
             chmod 600 "${NGINX_PREBACKUP}"
         fi
     else
-        rm -f "${prev}"
+        rm -f "${NGINX_PREV}"
     fi
     mv -f "${tmp}" "${NGINX_CONF}"
 
@@ -1195,79 +1416,8 @@ issue_certificate() {
 }
 
 # ============================================================
-# SITE: INPUT, GENERATOR, INSTALL
+# SITE: GENERATOR, INSTALL
 # ============================================================
-
-# Приводит файл к виду без BOM и без CRLF.
-normalize_site_input() {
-    local src="$1" dst="$2"
-    python3 - "${src}" "${dst}" <<'PY'
-import sys
-
-src, dst = sys.argv[1], sys.argv[2]
-with open(src, "rb") as f:
-    data = f.read()
-if data.startswith(b"\xef\xbb\xbf"):
-    data = data[3:]
-data = data.replace(b"\r\n", b"\n")
-with open(dst, "wb") as f:
-    f.write(data)
-PY
-    chmod 600 "${dst}"
-}
-
-# Печатает тип файла: bash, html, unsupported-shebang или unknown.
-detect_site_kind() {
-    local file="$1" first=""
-    first="$(sed -n '/[^[:space:]]/{p;q;}' "${file}")"
-
-    if [[ "${first}" == '#!'* ]]; then
-        if [[ "${first}" =~ ^#!.*(bash|/sh)([[:space:]]|$) ]]; then
-            echo "bash"
-        else
-            echo "unsupported-shebang"
-        fi
-        return 0
-    fi
-
-    if [[ "${first}" =~ ^[[:space:]]*\< ]] &&
-       grep -qiE '<!doctype[[:space:]]+html|<html|<head|<body' "${file}"; then
-        echo "html"
-        return 0
-    fi
-
-    echo "unknown"
-}
-
-# Полный снимок /etc/nginx до запуска генератора.
-snapshot_nginx() {
-    NGINX_SNAPSHOT="${WORK_DIR}/nginx-snapshot"
-    rm -rf "${NGINX_SNAPSHOT}"
-    cp -a /etc/nginx "${NGINX_SNAPSHOT}"
-    chmod 700 "${NGINX_SNAPSHOT}"
-}
-
-# Если генератор изменил nginx, возвращаем снимок целиком и проверяем конфиг.
-restore_nginx_if_changed() {
-    local diffs=""
-    diffs="$(diff -rq /etc/nginx "${NGINX_SNAPSHOT}" 2>/dev/null || true)"
-    if [[ -z "${diffs}" ]]; then
-        return 0
-    fi
-
-    warn "Генератор изменил конфигурацию nginx. Изменения откатываются:"
-    printf '%s\n' "${diffs}" | sed 's/^/    /' >&2
-
-    if command -v rsync >/dev/null 2>&1; then
-        rsync -a --delete "${NGINX_SNAPSHOT}/" /etc/nginx/
-    else
-        rm -rf /etc/nginx
-        cp -a "${NGINX_SNAPSHOT}" /etc/nginx
-    fi
-
-    nginx_test_or_show || die "После отката конфиг nginx не проходит проверку."
-    log "Конфиг nginx возвращён к состоянию до генератора."
-}
 
 # Создаёт подмены команд, чтобы генератор не управлял веб-сервером, фаерволом и сертификатами.
 create_generator_shims() {
@@ -1298,6 +1448,37 @@ EOF
     chmod 755 "${dir}/systemctl"
 }
 
+# Полный снимок /etc/nginx до запуска генератора.
+snapshot_nginx() {
+    local snap="${WORK_DIR}/nginx-snapshot"
+    rm -rf "${snap}"
+    cp -a /etc/nginx "${snap}"
+    chmod 700 "${snap}"
+    NGINX_SNAPSHOT="${snap}"
+}
+
+# Если генератор изменил nginx, возвращаем снимок целиком и проверяем конфиг.
+restore_nginx_if_changed() {
+    local diffs=""
+    diffs="$(diff -rq /etc/nginx "${NGINX_SNAPSHOT}" 2>/dev/null || true)"
+    if [[ -z "${diffs}" ]]; then
+        return 0
+    fi
+
+    warn "Генератор изменил конфигурацию nginx. Изменения откатываются:"
+    printf '%s\n' "${diffs}" | sed 's/^/    /' >&2
+
+    if command -v rsync >/dev/null 2>&1; then
+        rsync -a --delete "${NGINX_SNAPSHOT}/" /etc/nginx/
+    else
+        rm -rf /etc/nginx
+        cp -a "${NGINX_SNAPSHOT}" /etc/nginx
+    fi
+
+    nginx_test_or_show || die "После отката конфиг nginx не проходит проверку."
+    log "Конфиг nginx возвращён к состоянию до генератора."
+}
+
 # Останавливает веб-серверы, которые генератор запустил сам (например, через apt).
 stop_new_foreign_web_servers() {
     local before="$1" unit
@@ -1312,26 +1493,13 @@ stop_new_foreign_web_servers() {
     done
 }
 
-# Список процессов, слушающих 80, 443 и 8443: "порт процесс".
-listener_owners() {
-    ss -H -tlnp 2>/dev/null | awk '
-        {
-            n = split($4, a, ":"); port = a[n]
-            if (port != "80" && port != "443" && port != "8443") next
-            proc = "?"
-            if (match($0, /"[^"]+"/)) proc = substr($0, RSTART + 1, RLENGTH - 2)
-            print port, proc
-        }'
-}
-
-# Проверяет, что на 80 и 443 живут ожидаемые процессы.
-# rw-core — это Xray внутри ноды, он законно слушает 443 для Reality.
+# Проверяет, что на 80 и 443 живут ожидаемые процессы (после генератора).
 check_web_ports() {
     local port proc bad=""
     while read -r port proc; do
         [[ -n "${port}" ]] || continue
         case "${port}:${proc}" in
-            80:nginx|80:docker-proxy|8443:nginx) ;;
+            80:nginx|8443:nginx) ;;
             443:rw-core|443:xray|443:docker-proxy) ;;
             *) bad+="${port} (${proc}) " ;;
         esac
@@ -1383,9 +1551,26 @@ find_external_site() {
 
 # Выбирает каталог с готовым сайтом. Результат пишется в SITE_SOURCE_DIR.
 pick_site_source() {
-    local gen_dir="$1" marker="$2" html=""
+    local gen_dir="$1" marker="$2" cand="" dir="" html=""
 
     if [[ -f "${gen_dir}/index.html" ]]; then
+        SITE_SOURCE_DIR="${gen_dir}"
+        return 0
+    fi
+
+    # index.html в подкаталоге: берём ближайший к корню и весь его каталог (вместе с ассетами).
+    cand="$(
+        find "${gen_dir}" -mindepth 2 -maxdepth 4 -type f -name 'index.html' -printf '%d %p\n' 2>/dev/null |
+        sort -n | head -n1 | cut -d' ' -f2- || true
+    )"
+    if [[ -n "${cand}" ]]; then
+        dir="$(dirname "${cand}")"
+        warn "index.html найден в подкаталоге: ${dir#"${gen_dir}"/}. Используем его как корень сайта."
+        SITE_SOURCE_DIR="${dir}"
+        return 0
+    fi
+
+    if find_external_site "${marker}" "${gen_dir}" && [[ -f "${gen_dir}/index.html" ]]; then
         SITE_SOURCE_DIR="${gen_dir}"
         return 0
     fi
@@ -1393,22 +1578,15 @@ pick_site_source() {
     html="$(find "${gen_dir}" -maxdepth 4 -type f -name '*.html' -print 2>/dev/null | sort | head -n1 || true)"
     if [[ -n "${html}" ]]; then
         cp "${html}" "${gen_dir}/index.html"
-        warn "Генератор не создал index.html. Первая HTML-страница использована как index.html."
+        warn "Генератор не создал index.html. Первая HTML-страница использована как index.html (ассеты могут не подгрузиться)."
         SITE_SOURCE_DIR="${gen_dir}"
         return 0
-    fi
-
-    if find_external_site "${marker}" "${gen_dir}"; then
-        if [[ -f "${gen_dir}/index.html" ]]; then
-            SITE_SOURCE_DIR="${gen_dir}"
-            return 0
-        fi
     fi
 
     return 1
 }
 
-# Сохраняет лог генератора в /root, чтобы его можно было посмотреть после очистки.
+# Сохраняет лог генератора в каталог бэкапов, чтобы его можно было посмотреть после очистки.
 keep_generator_log() {
     local src="$1" dst="${NGINX_BACKUP_DIR}/generator-${BACKUP_SUFFIX}.log"
     if [[ -f "${src}" ]]; then
@@ -1416,6 +1594,17 @@ keep_generator_log() {
         cp -p "${src}" "${dst}"
         chmod 600 "${dst}"
         warn "Лог генератора сохранён: ${dst}"
+    fi
+}
+
+# Перезагружает nginx после отката, не падая, если конфиг пока не нужен.
+reload_nginx_quiet() {
+    if nginx -t >/dev/null 2>&1; then
+        if "${REAL_SYSTEMCTL}" is-active --quiet nginx; then
+            "${REAL_SYSTEMCTL}" reload nginx >/dev/null 2>&1 || true
+        else
+            "${REAL_SYSTEMCTL}" start nginx >/dev/null 2>&1 || true
+        fi
     fi
 }
 
@@ -1433,16 +1622,11 @@ run_site_generator() {
     cp "${script}" "${gen_dir}/generator.sh"
     chmod 700 "${gen_dir}/generator.sh"
 
-    if ! bash -n "${gen_dir}/generator.sh" 2>"${WORK_DIR}/generator-syntax.log"; then
-        cat "${WORK_DIR}/generator-syntax.log" >&2
-        die "В bash-генераторе обнаружена синтаксическая ошибка."
-    fi
-
     create_generator_shims "${shim_dir}"
 
     # Генератору могут понадобиться пакеты: ждём освобождения apt и обновляем индекс.
     wait_for_apt
-    apt-get update -qq >/dev/null 2>&1 || true
+    apt-get update -qq >/dev/null 2>&1 || warn "Не удалось обновить индекс apt до генератора."
 
     snapshot_nginx
 
@@ -1471,12 +1655,12 @@ run_site_generator() {
             timeout --kill-after=20 "${GENERATOR_TIMEOUT}" bash "${gen_dir}/generator.sh" "${gen_dir}" </dev/null
     ) > "${gen_log}" 2>&1 || rc=$?
 
-    # Что бы ни сделал генератор, возвращаем веб-сервер, фаервол и дефолты до любых проверок.
+    # Что бы ни сделал генератор, возвращаем веб-сервер и фаервол до любых проверок.
     rm -f "${gen_dir}/generator.sh"
     stop_new_foreign_web_servers "${foreign_before}"
     restore_nginx_if_changed
     ensure_firewall_after_generator
-    restart_nginx_checked
+    reload_nginx_quiet
 
     if (( rc != 0 )); then
         tail -n 30 "${gen_log}" >&2 || true
@@ -1484,7 +1668,7 @@ run_site_generator() {
         if (( rc == 124 || rc == 137 )); then
             die "Генератор не завершился за ${GENERATOR_TIMEOUT} секунд. Возможно, он ждёт ввод."
         fi
-        die "Генератор сайта завершился с кодом ${rc}. Лог сохранён."
+        die "Генератор сайта завершился с кодом ${rc}. Лог сохранён. Nginx и UFW не изменены."
     fi
 
     check_web_ports || die "Посторонние процессы заняли порты 80/443. Остановите их и повторите установку."
@@ -1551,6 +1735,7 @@ install_final_site() {
     log "Сайт установлен в ${SITE_ROOT}."
 }
 
+# Готовит сайт полностью до любых изменений nginx. Если генератор упал, nginx не трогается.
 install_site() {
     [[ -n "${SITE_FILE}" && -s "${SITE_FILE}" ]] || die "Сайт не передан."
 
@@ -1558,7 +1743,8 @@ install_site() {
     chmod 700 "${WORK_DIR}"
 
     local norm="${WORK_DIR}/site.input"
-    normalize_site_input "${SITE_FILE}" "${norm}"
+    cp "${SITE_FILE}" "${norm}"
+    chmod 600 "${norm}"
 
     local kind=""
     kind="$(detect_site_kind "${norm}")"
@@ -1574,17 +1760,13 @@ install_site() {
             log "Обнаружен bash-генератор сайта."
             run_site_generator "${norm}"
             ;;
-        unsupported-shebang)
-            die "Первая строка задаёт не bash и не sh. Поддерживаются HTML и bash-генератор (#!/bin/bash)."
-            ;;
         *)
-            die "Не удалось распознать сайт. Нужен HTML (с <!DOCTYPE html> или <html>) или bash-генератор с первой строкой #!/bin/bash."
+            die "Не удалось распознать сайт при установке. Перезапустите установщик и вставьте сайт заново."
             ;;
     esac
 
     prepare_final_site "${SITE_SOURCE_DIR}"
     install_final_site
-    "${REAL_SYSTEMCTL}" reload nginx >/dev/null 2>&1 || true
 }
 
 verify_site() {
@@ -1599,13 +1781,15 @@ verify_site() {
     log "Сайт-заглушка отвечает на ${SITE_DOMAIN}."
 }
 
+# Порядок важен: сначала готовится сайт (без изменений nginx), затем конфиг, сертификат и финальный конфиг.
 configure_selfsteal() {
     log "Настройка self-steal..."
     install_nginx
     install_generator_tools
     check_nginx_domain_conflicts
 
-    mkdir -p "${SITE_ROOT}/.well-known/acme-challenge"
+    install_site
+
     write_nginx_config http
     restart_nginx_checked
 
@@ -1614,7 +1798,6 @@ configure_selfsteal() {
     write_nginx_config ssl
     restart_nginx_checked
 
-    install_site
     verify_site
 }
 
@@ -1672,6 +1855,17 @@ load_cascade_state() {
     CASCADE=1
 }
 
+show_block() {
+    echo
+    echo "========================================"
+    echo "  $1"
+    echo "========================================"
+    echo
+    printf '%s\n' "$2"
+    echo
+    echo "========================================"
+}
+
 cascade_show_eu_instructions() {
     local text
     text="$(cat <<EOF
@@ -1692,6 +1886,7 @@ cascade_show_eu_instructions() {
 8. Убедитесь, что на EU есть клиент с UUID ${EU_UUID} и flow xtls-rprx-vision.
 9. Вернитесь на RU-сервер. Скрипт будет ждать ввода PublicKey и Short ID с EU.
    Если прервались, запустите установщик на RU и выберите пункт 5.
+   Если на EU установка сайта прервалась, на EU выберите пункт 6.
 EOF
 )"
     show_block "ДЕЙСТВИЕ НА EU-СЕРВЕРЕ" "${text}"
@@ -1827,17 +2022,6 @@ PY
     [[ -n "${PROFILE_JSON}" ]] || die "Не удалось собрать профиль."
 }
 
-show_block() {
-    echo
-    echo "========================================"
-    echo "  $1"
-    echo "========================================"
-    echo
-    printf '%s\n' "$2"
-    echo
-    echo "========================================"
-}
-
 # Выводит профиль в терминал. Файлов с профилем не создаётся.
 output_node_profile() {
     build_profile
@@ -1885,13 +2069,39 @@ resume_cascade() {
     finish_cascade
 }
 
+# Доделывает self-steal (сайт, nginx, сертификат) на уже работающей ноде.
+# Нужна, если предыдущая установка прервалась после запуска ноды.
+resume_selfsteal() {
+    local status=""
+    status="$(docker inspect -f '{{.State.Status}}' "${CONTAINER_NAME}" 2>/dev/null || true)"
+    [[ "${status}" == "running" ]] || die "Контейнер ноды не запущен (статус: ${status:-нет}). Используйте пункт 4."
+
+    SELFSTEAL=1
+    CASCADE=0
+
+    warn "Нода не переустанавливается, но Reality-ключи будут сгенерированы заново."
+    warn "Новый PROFILE нужно вставить в панель вместо старого."
+    confirm_continue "Продолжить? [y/N]: "
+
+    install_packages
+    preflight_ports
+
+    ask_selfsteal_domain
+    ask_inbound_name INBOUND_NAME "Название инбаунда этой ноды (например, RU_IN): "
+    collect_site
+
+    configure_selfsteal
+    generate_keys
+    output_node_profile
+}
+
 fresh_install() {
     if (( REINSTALL == 0 )); then
         if [[ -d "${INSTALL_DIR}" ]] || docker_container_exists; then
             if [[ -f "${CASCADE_STATE_FILE}" ]]; then
                 die "Обнаружена установка и незавершённый каскад. Выберите пункт 5 (продолжить) или 4 (переустановка)."
             fi
-            die "Обнаружена существующая установка. Выберите пункт 4 (переустановка)."
+            die "Обнаружена существующая установка. Выберите пункт 4 (переустановка) или 6 (доделать self-steal)."
         fi
     fi
 
@@ -1899,6 +2109,7 @@ fresh_install() {
 
     install_packages
     install_docker
+    preflight_ports
 
     if (( REINSTALL == 1 )); then
         remove_remnanode
@@ -1919,11 +2130,11 @@ fresh_install() {
     create_configuration
     start_node
 
+    generate_keys
+
     if (( SELFSTEAL == 1 )); then
         configure_selfsteal
     fi
-
-    generate_keys
 
     if (( CASCADE == 1 )); then
         save_cascade_state
@@ -1990,6 +2201,8 @@ main() {
 
     if (( RESUME == 1 )); then
         resume_cascade
+    elif (( RESUME_SITE == 1 )); then
+        resume_selfsteal
     else
         fresh_install
     fi
