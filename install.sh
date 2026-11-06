@@ -5,12 +5,14 @@
 #
 set -Eeuo pipefail
 
-INSTALLER_VERSION="1.10.0"
+INSTALLER_VERSION="1.11.0"
 INSTALLER_URL="https://raw.githubusercontent.com/Wanderer-95/remnanode-installer/main/install.sh"
 
 export DEBIAN_FRONTEND=noninteractive
 export NEEDRESTART_MODE=a
 export NEEDRESTART_SUSPEND=1
+
+REAL_SYSTEMCTL="$(command -v systemctl || echo /bin/systemctl)"
 
 INSTALL_DIR="/opt/remnanode"
 CONTAINER_NAME="remnanode"
@@ -26,9 +28,13 @@ JOURNALD_DROPIN="/etc/systemd/journald.conf.d/99-remnanode.conf"
 
 NGINX_CONF="/etc/nginx/conf.d/remnanode-selfsteal.conf"
 NGINX_PREBACKUP="${NGINX_CONF}.pre-remnanode"
-SITE_ROOT="/var/www/remnanode-selfsteal"
+NGINX_BACKUP_DIR="/root/remnanode-backups"
 SITE_ROOT_BASE="/var/www/remnanode-selfsteal"
+SITE_ROOT="${SITE_ROOT_BASE}"
 GENERATOR_TIMEOUT=900
+
+# Веб-серверы, которые генератор мог запустить через apt. Останавливаются, если появились после него.
+FOREIGN_WEB_UNITS=(apache2 httpd lighttpd caddy)
 
 # Состояние каскада пишется на RU, пока ждём данные с EU.
 # Содержит приватный ключ RU, права 600. Удаляется после подтверждения Enter.
@@ -37,7 +43,6 @@ CASCADE_STATE_FILE="/root/remnanode-cascade.state"
 LEGACY_PROFILE_FILE="/root/remnanode-profile.json"
 
 BACKUP_SUFFIX="$(date +%Y%m%d-%H%M%S)"
-NGINX_BACKUP_DIR="/root/remnanode-backups"
 
 DOMAIN_RE='^([A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?\.)+[A-Za-z]{2,63}$'
 UUID_RE='^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$'
@@ -164,6 +169,13 @@ ask_secret_confirmed() {
     done
 }
 
+# confirm_continue "вопрос": продолжаем только при явном y
+confirm_continue() {
+    local answer=""
+    read -r -p "${1:-Продолжить? [y/N]: }" answer
+    [[ "${answer}" =~ ^[Yy]$ ]] || die "Остановлено пользователем."
+}
+
 # ============================================================
 # CHECKS AND MENU
 # ============================================================
@@ -180,9 +192,7 @@ check_system() {
 
     if [[ "${VERSION_ID:-}" != "24.04" ]]; then
         warn "Рекомендуется Ubuntu 24.04. Текущая версия: ${VERSION_ID:-unknown}"
-        local answer=""
-        read -r -p "Продолжить? [y/N]: " answer
-        [[ "${answer}" =~ ^[Yy]$ ]] || exit 0
+        confirm_continue "Продолжить? [y/N]: "
     fi
 
     log "Операционная система: ${PRETTY_NAME:-Ubuntu}"
@@ -278,7 +288,7 @@ with open(sys.argv[1], encoding="utf-8") as f:
             print(value)
             break
 PY
-        )"
+        )" || true
     fi
 }
 
@@ -315,26 +325,44 @@ read_secret_key() {
     log "SECRET_KEY принят."
 }
 
+# Проверяет, что домен указывает на этот сервер. Только предупреждает, не блокирует.
+check_dns_points_here() {
+    local domain="$1" dns_ip="" my_ip=""
+
+    dns_ip="$(getent ahostsv4 "${domain}" 2>/dev/null | awk 'NR==1 {print $1}' || true)"
+    my_ip="$(curl -4 -fsS --max-time 10 https://api.ipify.org 2>/dev/null || true)"
+
+    if [[ -z "${dns_ip}" ]]; then
+        warn "Домен ${domain} пока не резолвится."
+        warn "Создайте A-запись на ${my_ip:-IP этого сервера} и дождитесь обновления DNS."
+        confirm_continue "Продолжить без DNS? [y/N]: "
+    elif [[ -n "${my_ip}" && "${dns_ip}" != "${my_ip}" ]]; then
+        warn "Домен ${domain} указывает на ${dns_ip}, а IP этого сервера: ${my_ip}."
+        warn "Если домен за Cloudflare-прокси (оранжевое облако), переключите его в режим DNS only."
+        confirm_continue "Продолжить? [y/N]: "
+    else
+        log "DNS: ${domain} -> ${dns_ip}"
+    fi
+}
+
 ask_selfsteal_domain() {
     ask_valid SITE_DOMAIN "Домен этой ноды (self-steal, A-запись на этот сервер): " "${DOMAIN_RE}" "Некорректный домен."
     SITE_DOMAIN="${SITE_DOMAIN,,}"
     SITE_ROOT="${SITE_ROOT_BASE}/${SITE_DOMAIN}"
     log "Домен: ${SITE_DOMAIN}"
     log "Каталог сайта: ${SITE_ROOT}"
+    check_dns_points_here "${SITE_DOMAIN}"
 }
 
 collect_site() {
     echo
     info "Сайт-заглушку можно передать двумя способами:"
     info " - HTML-страница (начинается с <!DOCTYPE html> или <html>);"
-    info " - bash-генератор, первая строка которого #!/bin/bash."
-    info "Генератор запускается от root без ввода с клавиатуры. Он может сам ставить нужные пакеты"
-    info "(apt, pip, npm и т.д.). Установщик заранее ставит: curl wget git unzip zip jq rsync python3."
-    info "Сайт нужно писать в каталог из первого аргумента \$1"
-    info "(также доступен в переменных OUT_DIR, SITE_ROOT, WEB_ROOT, SITE_DOMAIN)."
+    info " - bash-генератор, первая строка которого #!/bin/bash или #!/bin/sh."
+    info "Генератор запускается от root без ввода с клавиатуры и может сам ставить пакеты."
+    info "Сайт нужно записать в каталог из первого аргумента \$1 (также доступен в OUT_DIR, SITE_ROOT, WEB_ROOT)."
+    info "Генератор не должен настраивать nginx, firewall и сертификаты: это делает установщик."
     info "Если генератор положит сайт в другое место (например /var/www/html), установщик найдёт его сам."
-    info "Настраивать nginx и выпускать сертификаты генератору не нужно: это делает установщик."
-    info "Любые изменения /etc/nginx, сделанные генератором, откатываются."
     info "Вставьте сайт целиком, затем на новой строке нажмите Ctrl+D."
 
     PASTE_TMP="$(mktemp /tmp/remnanode-site.XXXXXX)"
@@ -351,7 +379,7 @@ ask_restart_if_needed() {
             docker ps --format '{{.Names}}' 2>/dev/null |
             { grep -vx "${CONTAINER_NAME}" || true; } |
             wc -l
-        )"
+        )" || count=0
     fi
     count="${count//[[:space:]]/}"
 
@@ -429,21 +457,28 @@ remove_remnanode() {
         rm -f -- "${NGINX_CONF}"
     fi
     rm -f -- "${CASCADE_STATE_FILE}" "${LEGACY_PROFILE_FILE}"
+
     local hook="/etc/letsencrypt/renewal-hooks/deploy/remnanode-selfsteal-reload-nginx.sh"
     local hook_backup=""
-    hook_backup="$(find "$(dirname "${hook}")" -maxdepth 1 -type f -name "$(basename "${hook}").bak.*" -printf '%T@ %p\n' 2>/dev/null | sort -nr | awk 'NR==1 {$1=""; sub(/^ /,""); print}')"
+    hook_backup="$(
+        find "$(dirname "${hook}")" -maxdepth 1 -type f -name "$(basename "${hook}").bak.*" \
+            -printf '%T@ %p\n' 2>/dev/null | sort -nr | awk 'NR==1 {$1=""; sub(/^ /,""); print}'
+    )" || true
     if [[ -n "${hook_backup}" && -f "${hook_backup}" ]]; then
         cp -a "${hook_backup}" "${hook}"
     else
         rm -f -- "${hook}"
     fi
+
     if systemctl is-active --quiet nginx; then
-        nginx -t >/dev/null 2>&1 && systemctl reload nginx ||
-            warn "Nginx не перезагружен: проверьте конфигурацию вручную."
+        if nginx -t >/dev/null 2>&1; then
+            systemctl reload nginx || warn "Nginx не перезагружен."
+        else
+            warn "Конфигурация nginx не проходит проверку после удаления. Проверьте её вручную."
+        fi
     fi
 
-    # Удаляем тег образа только если ни один контейнер (включая остановленные)
-    # больше не использует этот образ.
+    # Удаляем образ только если ни один контейнер (включая остановленные) его не использует.
     if command -v docker >/dev/null 2>&1 && docker image inspect "${IMAGE}" >/dev/null 2>&1; then
         local users=""
         users="$(docker ps -a --filter "ancestor=${IMAGE}" --format '{{.Names}}' 2>/dev/null || true)"
@@ -494,8 +529,7 @@ install_packages() {
     log "Необходимые пакеты установлены."
 }
 
-# Утилиты, которые часто нужны генераторам сайтов. Ставятся только в режимах с self-steal.
-# Сбой установки отдельных пакетов не критичен.
+# Утилиты, которые часто нужны генераторам сайтов. Сбой отдельных пакетов не критичен.
 install_generator_tools() {
     log "Установка утилит для генератора сайта..."
     wait_for_apt
@@ -768,11 +802,11 @@ verify_docker_logging() {
 
     # Docker Info не во всех версиях показывает log-opts, поэтому сверяем daemon.json.
     python3 - "${DOCKER_DAEMON_JSON}" <<'PY'
-import json,sys
-with open(sys.argv[1],encoding="utf-8") as f:
-    cfg=json.load(f)
+import json, sys
+with open(sys.argv[1], encoding="utf-8") as f:
+    cfg = json.load(f)
 assert cfg.get("log-driver") == "json-file", "log-driver != json-file"
-opts=cfg.get("log-opts",{})
+opts = cfg.get("log-opts", {})
 assert opts.get("max-size") == "50m", "max-size != 50m"
 assert opts.get("max-file") == "3", "max-file != 3"
 PY
@@ -783,9 +817,7 @@ PY
 # FIREWALL
 # ============================================================
 
-# Собирает все порты SSH, которые могут быть активны:
-# из текущей сессии, из конфига sshd, из реально слушающих процессов и из ssh.socket.
-# Все найденные порты открываются, чтобы не потерять доступ к серверу.
+# Собирает все порты SSH, которые могут быть активны. Все открываются, чтобы не потерять доступ.
 detect_ssh_ports() {
     local candidates
     candidates="$(
@@ -832,7 +864,7 @@ configure_firewall() {
     log "UFW настроен. Открыты SSH-порты: ${ssh_ports% }."
 }
 
-# Генератор работает от root и мог изменить правила UFW. Возвращаем нужные порты.
+# Генератор мог изменить правила UFW. Возвращаем нужные порты.
 ensure_firewall_after_generator() {
     local port
     while read -r port; do
@@ -916,19 +948,26 @@ start_node() {
 }
 
 # Генерирует ключи Reality один раз для всех режимов.
+# В образе бинарник может называться xray или rw-core, пробуем оба.
 generate_keys() {
     log "Генерация ключей Reality (X25519)..."
 
-    local out
-    out="$(docker exec "${CONTAINER_NAME}" xray x25519)" || die "Не удалось сгенерировать X25519."
+    local out="" bin
+    for bin in xray rw-core; do
+        out="$(docker exec "${CONTAINER_NAME}" "${bin}" x25519 2>/dev/null || true)"
+        if [[ -n "${out}" ]]; then
+            break
+        fi
+    done
+    [[ -n "${out}" ]] || die "Не удалось выполнить x25519 в контейнере ноды (пробовали xray и rw-core)."
 
-    # Новые версии Xray печатают "Password (PublicKey)", старые — "PublicKey".
+    # Новые версии печатают "Password (PublicKey)", старые — "PublicKey".
     PRIVATE_KEY="$(awk -F': *' '/^PrivateKey/ {print $2; exit}' <<< "${out}" | tr -d '[:space:]')"
     PUBLIC_KEY="$(awk -F': *' '/^(PublicKey|Password)/ {print $2; exit}' <<< "${out}" | tr -d '[:space:]')"
     SHORT_ID="$(openssl rand -hex 8)"
 
     [[ "${PRIVATE_KEY}" =~ ${PUBKEY_RE} && "${PUBLIC_KEY}" =~ ${PUBKEY_RE} ]] ||
-        die "Не удалось разобрать вывод xray x25519."
+        die "Не удалось разобрать вывод x25519: ${out}"
     [[ "${SHORT_ID}" =~ ${SHORTID_RE} ]] || die "Не удалось сгенерировать Short ID."
     log "Ключи сгенерированы."
 }
@@ -966,17 +1005,28 @@ install_nginx() {
     log "nginx ${NGINX_VERSION} установлен."
 }
 
+# Проверка nginx -t с выводом ошибки. Возвращает 0 при успехе.
+nginx_test_or_show() {
+    local out=""
+    if ! out="$(nginx -t 2>&1)"; then
+        printf '%s\n' "${out}" >&2
+        return 1
+    fi
+    return 0
+}
+
 # Не меняем чужие конфиги: при конфликте останавливаем установку и сообщаем точный файл.
 check_nginx_domain_conflicts() {
-    local f dir
+    local f dir escaped
     local -a dirs=(/etc/nginx/conf.d /etc/nginx/sites-enabled)
+    escaped="${SITE_DOMAIN//./\\.}"
 
     for dir in "${dirs[@]}"; do
         [[ -d "${dir}" ]] || continue
         while IFS= read -r -d '' f; do
             [[ "${f}" == "${NGINX_CONF}" ]] && continue
             [[ "$(basename "${f}")" == remnanode-* ]] && continue
-            if grep -qE "^[[:space:]]server_name[[:space:]].(^|[[:space:]])${SITE_DOMAIN//./\\.}([[:space:];]|$)" "${f}" 2>/dev/null ||
+            if grep -qE "^[[:space:]]*server_name[^;]*[[:space:]]${escaped}([[:space:];]|$)" "${f}" 2>/dev/null ||
                grep -qF "/etc/letsencrypt/live/${SITE_DOMAIN}/" "${f}" 2>/dev/null; then
                 warn "Найден конфиг Nginx с доменом ${SITE_DOMAIN}: ${f}"
                 die "Конфликт домена. Чужой конфиг не изменён. Устраните конфликт вручную или выберите другой домен."
@@ -985,10 +1035,21 @@ check_nginx_domain_conflicts() {
     done
 }
 
+# Возвращает предыдущую версию нашего конфига (или удаляет его, если предыдущей не было).
+restore_prev_nginx_conf() {
+    local prev="${NGINX_BACKUP_DIR}/remnanode-selfsteal.conf.prev"
+    if [[ -f "${prev}" ]]; then
+        cp -a "${prev}" "${NGINX_CONF}"
+    else
+        rm -f "${NGINX_CONF}"
+    fi
+}
+
 write_nginx_config() {
     local stage="$1"
     local tmp="${NGINX_CONF}.new.$$"
-    local backup=""
+    local prev="${NGINX_BACKUP_DIR}/remnanode-selfsteal.conf.prev"
+
     mkdir -p /etc/nginx/conf.d "${NGINX_BACKUP_DIR}"
     chmod 700 "${NGINX_BACKUP_DIR}"
 
@@ -1055,37 +1116,52 @@ NGINX
     chmod 644 "${tmp}"
 
     if [[ -f "${NGINX_CONF}" ]]; then
-        backup="${NGINX_BACKUP_DIR}/remnanode-selfsteal.conf.bak.${BACKUP_SUFFIX}"
-        cp -a "${NGINX_CONF}" "${backup}"
+        cp -a "${NGINX_CONF}" "${prev}"
+        cp -a "${NGINX_CONF}" "${NGINX_BACKUP_DIR}/remnanode-selfsteal.conf.bak.${BACKUP_SUFFIX}"
         if [[ ! -e "${NGINX_PREBACKUP}" ]]; then
             cp -a "${NGINX_CONF}" "${NGINX_PREBACKUP}"
             chmod 600 "${NGINX_PREBACKUP}"
         fi
+    else
+        rm -f "${prev}"
     fi
     mv -f "${tmp}" "${NGINX_CONF}"
 
-    if ! nginx -t >/dev/null 2>&1; then
-        if [[ -n "${backup}" && -f "${backup}" ]]; then
-            cp -a "${backup}" "${NGINX_CONF}"
-        else
-            rm -f "${NGINX_CONF}"
-        fi
-        nginx -t || true
+    if ! nginx_test_or_show; then
+        restore_prev_nginx_conf
         die "Конфигурация nginx не прошла проверку. Предыдущий конфиг восстановлен."
     fi
     log "Конфиг nginx записан и проверен: ${NGINX_CONF}"
 }
 
-# Проверка внешней доступности порта 80 до запроса сертификата.
+# Перезапуск nginx с откатом на предыдущий конфиг при неудаче.
+restart_nginx_checked() {
+    if "${REAL_SYSTEMCTL}" restart nginx && "${REAL_SYSTEMCTL}" is-active --quiet nginx; then
+        return 0
+    fi
+
+    warn "Nginx не запустился. Откатываем конфиг к предыдущей версии."
+    warn "Проверьте, не занят ли порт 80 другим сервисом: ss -tlnp | grep ':80 '"
+    restore_prev_nginx_conf
+    if nginx_test_or_show; then
+        "${REAL_SYSTEMCTL}" restart nginx || true
+    fi
+    die "Новая конфигурация Nginx не применена; предыдущая восстановлена."
+}
+
+# Проверка, что ACME-каталог отдаётся через nginx локально.
 check_http_reachable() {
     local token="remnanode-check-$$" dir="${SITE_ROOT}/.well-known/acme-challenge" code=""
+    mkdir -p "${dir}"
     echo "${token}" > "${dir}/${token}"
     chmod 644 "${dir}/${token}"
     code="$(curl -s -o /dev/null -w '%{http_code}' --max-time 15 \
         --resolve "${SITE_DOMAIN}:80:127.0.0.1" "http://${SITE_DOMAIN}/.well-known/acme-challenge/${token}" || true)"
     rm -f "${dir}/${token}"
     if [[ "${code}" != "200" ]]; then
-        warn "Локальная проверка ACME-каталога вернула ${code}. nginx может быть настроен неверно."
+        warn "Локальная проверка ACME-каталога вернула ${code}. Проверьте nginx: nginx -T | less"
+    else
+        log "ACME-каталог отдаётся через nginx."
     fi
 }
 
@@ -1093,7 +1169,7 @@ issue_certificate() {
     log "Получение сертификата Let's Encrypt для ${SITE_DOMAIN}..."
 
     mkdir -p "${SITE_ROOT}/.well-known/acme-challenge"
-    chmod 755 "${SITE_ROOT}" "${SITE_ROOT}/.well-known" "${SITE_ROOT}/.well-known/acme-challenge"
+    chmod 755 "${SITE_ROOT_BASE}" "${SITE_ROOT}" "${SITE_ROOT}/.well-known" "${SITE_ROOT}/.well-known/acme-challenge"
     check_http_reachable
 
     certbot certonly \
@@ -1103,7 +1179,7 @@ issue_certificate() {
         --register-unsafely-without-email \
         --non-interactive \
         --keep-until-expiring ||
-        die "Не удалось получить сертификат. Проверьте DNS-запись и открытый порт 80."
+        die "Не удалось получить сертификат. Проверьте DNS-запись и открытый снаружи порт 80."
 
     [[ -f "/etc/letsencrypt/live/${SITE_DOMAIN}/fullchain.pem" ]] ||
         die "Сертификат не найден после выпуска."
@@ -1114,23 +1190,8 @@ issue_certificate() {
     printf '#!/bin/sh\nsystemctl reload nginx\n' > "${hook}"
     chmod 755 "${hook}"
 
-    # Dry-run идёт на staging Let's Encrypt и может не пройти из-за его лимитов или
-    # временных сбоев. Реальный сертификат при этом уже выпущен. Показываем причину.
-    local dry_log
-    dry_log="$(mktemp /tmp/remnanode-certbot-dry.XXXXXX)"
-    if certbot renew --cert-name "${SITE_DOMAIN}" --dry-run >"${dry_log}" 2>&1; then
-        log "Проверка автообновления сертификата прошла."
-    else
-        warn "Проверка автообновления (staging) не прошла. Сертификат выпущен и рабочий."
-        warn "Последние строки вывода certbot:"
-        tail -n 12 "${dry_log}" | sed 's/^/    /' >&2 || true
-        warn "Частые причины: порт 80 закрыт снаружи, домен за CDN-прокси (Cloudflare), лимиты staging."
-        warn "Позже проверьте вручную: certbot renew --cert-name ${SITE_DOMAIN} --dry-run"
-    fi
-    rm -f "${dry_log}"
-
     systemctl enable --now certbot.timer >/dev/null 2>&1 || true
-    log "Сертификат получен."
+    log "Сертификат получен. Автообновление включено (certbot.timer)."
 }
 
 # ============================================================
@@ -1157,7 +1218,7 @@ PY
 
 # Печатает тип файла: bash, html, unsupported-shebang или unknown.
 detect_site_kind() {
-    local file="$1" first
+    local file="$1" first=""
     first="$(sed -n '/[^[:space:]]/{p;q;}' "${file}")"
 
     if [[ "${first}" == '#!'* ]]; then
@@ -1197,37 +1258,90 @@ restore_nginx_if_changed() {
     warn "Генератор изменил конфигурацию nginx. Изменения откатываются:"
     printf '%s\n' "${diffs}" | sed 's/^/    /' >&2
 
-    rm -rf /etc/nginx
-    cp -a "${NGINX_SNAPSHOT}" /etc/nginx
-    nginx -t >/dev/null 2>&1 || die "После отката конфиг nginx не проходит проверку."
-    systemctl restart nginx || die "Не удалось перезапустить nginx после отката."
+    if command -v rsync >/dev/null 2>&1; then
+        rsync -a --delete "${NGINX_SNAPSHOT}/" /etc/nginx/
+    else
+        rm -rf /etc/nginx
+        cp -a "${NGINX_SNAPSHOT}" /etc/nginx
+    fi
+
+    nginx_test_or_show || die "После отката конфиг nginx не проходит проверку."
     log "Конфиг nginx возвращён к состоянию до генератора."
 }
 
-# Сохраняет лог генератора в /root, чтобы его можно было посмотреть после очистки.
-keep_generator_log() {
-    local src="$1" dst="/root/remnanode-generator-${BACKUP_SUFFIX}.log"
-    if [[ -f "${src}" ]]; then
-        cp -p "${src}" "${dst}"
-        chmod 600 "${dst}"
-        warn "Лог генератора сохранён: ${dst}"
-    fi
+# Создаёт подмены команд, чтобы генератор не управлял веб-сервером, фаерволом и сертификатами.
+create_generator_shims() {
+    local dir="$1" name real
+    mkdir -p "${dir}"
+    real="${REAL_SYSTEMCTL}"
+
+    for name in nginx apache2 apache2ctl httpd lighttpd caddy certbot ufw; do
+        cat > "${dir}/${name}" <<EOF
+#!/bin/sh
+echo "[installer] команда '${name} \$*' пропущена: этим управляет установщик" >&2
+exit 0
+EOF
+        chmod 755 "${dir}/${name}"
+    done
+
+    cat > "${dir}/systemctl" <<EOF
+#!/bin/sh
+for a in "\$@"; do
+    case "\$a" in
+        *nginx*|*apache2*|*httpd*|*lighttpd*|*caddy*|*ufw*|*certbot*)
+            echo "[installer] systemctl \$* пропущен: этим управляет установщик" >&2
+            exit 0 ;;
+    esac
+done
+exec "${real}" "\$@"
+EOF
+    chmod 755 "${dir}/systemctl"
 }
 
-# Проверяет, что посторонний сервис не занял 80 или 443.
-check_ports_after_generator() {
-    local owners=""
-    owners="$(
-        ss -tlnp 2>/dev/null |
-        awk 'NR>1 && $4 ~ /:(80|443)$/' |
-        { grep -vE '"(nginx|xray|docker-proxy)"' || true; }
-    )"
+# Останавливает веб-серверы, которые генератор запустил сам (например, через apt).
+stop_new_foreign_web_servers() {
+    local before="$1" unit
+    for unit in "${FOREIGN_WEB_UNITS[@]}"; do
+        if grep -qx "${unit}" "${before}" 2>/dev/null; then
+            continue
+        fi
+        if "${REAL_SYSTEMCTL}" is-active --quiet "${unit}" 2>/dev/null; then
+            warn "Генератор запустил посторонний веб-сервер ${unit}. Останавливаем и отключаем."
+            "${REAL_SYSTEMCTL}" disable --now "${unit}" >/dev/null 2>&1 || true
+        fi
+    done
+}
 
-    if [[ -n "${owners}" ]]; then
-        warn "На портах 80 или 443 работает посторонний сервис:"
-        printf '%s\n' "${owners}" >&2
-        die "Генератор поднял свой веб-сервер. Сайт должен отдаваться через nginx установщика."
+# Список процессов, слушающих 80, 443 и 8443: "порт процесс".
+listener_owners() {
+    ss -H -tlnp 2>/dev/null | awk '
+        {
+            n = split($4, a, ":"); port = a[n]
+            if (port != "80" && port != "443" && port != "8443") next
+            proc = "?"
+            if (match($0, /"[^"]+"/)) proc = substr($0, RSTART + 1, RLENGTH - 2)
+            print port, proc
+        }'
+}
+
+# Проверяет, что на 80 и 443 живут ожидаемые процессы.
+# rw-core — это Xray внутри ноды, он законно слушает 443 для Reality.
+check_web_ports() {
+    local port proc bad=""
+    while read -r port proc; do
+        [[ -n "${port}" ]] || continue
+        case "${port}:${proc}" in
+            80:nginx|80:docker-proxy|8443:nginx) ;;
+            443:rw-core|443:xray|443:docker-proxy) ;;
+            *) bad+="${port} (${proc}) " ;;
+        esac
+    done < <(listener_owners)
+
+    if [[ -n "${bad}" ]]; then
+        warn "На портах заняты посторонние процессы: ${bad}"
+        return 1
     fi
+    return 0
 }
 
 check_node_running() {
@@ -1237,33 +1351,39 @@ check_node_running() {
         die "Контейнер ноды не в статусе running после генератора (статус: ${status:-unknown})."
 }
 
-# Если генератор положил сайт не в $1, а в стандартные каталоги веб-сервера,
-# берём самый свежий index.html, изменённый после запуска генератора.
+# Если генератор положил сайт не в $1, ищем свежий index.html в стандартных каталогах.
+# Домашние каталоги и /tmp не сканируем, чтобы не скопировать чужие файлы в публичный сайт.
 find_external_site() {
     local marker="$1" gen_dir="$2" idx="" dir=""
 
     idx="$(
-        find /var/www /usr/share/nginx/html /srv /root /home /tmp \
-            -maxdepth 6 -type f -name 'index.html' -newer "${marker}" \
+        find /var/www /usr/share/nginx/html /srv /opt -maxdepth 5 -type f -name 'index.html' \
+            -newer "${marker}" \
             -not -path "${SITE_ROOT_BASE}/*" \
             -not -path "${WORK_DIR}/*" \
             -not -path '*/node_modules/*' \
-            -not -path '*/.cache/*' \
             -printf '%T@ %p\n' 2>/dev/null |
         sort -nr | awk 'NR==1 {$1=""; sub(/^ /,""); print}'
-    )"
+    )" || true
 
     [[ -n "${idx}" && -f "${idx}" ]] || return 1
     dir="$(dirname "${idx}")"
+
+    case "${dir}" in
+        /|/var/www|/srv|/opt|/usr|/usr/share|/usr/share/nginx)
+            warn "Найденный каталог слишком общий (${dir}). Сайт не копируется."
+            return 1
+            ;;
+    esac
+
     warn "Генератор записал сайт вне каталога \$1. Найден: ${dir}"
     cp -a "${dir}/." "${gen_dir}/"
     return 0
 }
 
-# Выбирает каталог, где лежит готовый сайт. Результат пишется в SITE_SOURCE_DIR.
+# Выбирает каталог с готовым сайтом. Результат пишется в SITE_SOURCE_DIR.
 pick_site_source() {
-    local gen_dir="$1" marker="$2"
-    local html=""
+    local gen_dir="$1" marker="$2" html=""
 
     if [[ -f "${gen_dir}/index.html" ]]; then
         SITE_SOURCE_DIR="${gen_dir}"
@@ -1288,37 +1408,62 @@ pick_site_source() {
     return 1
 }
 
+# Сохраняет лог генератора в /root, чтобы его можно было посмотреть после очистки.
+keep_generator_log() {
+    local src="$1" dst="${NGINX_BACKUP_DIR}/generator-${BACKUP_SUFFIX}.log"
+    if [[ -f "${src}" ]]; then
+        mkdir -p "${NGINX_BACKUP_DIR}"
+        cp -p "${src}" "${dst}"
+        chmod 600 "${dst}"
+        warn "Лог генератора сохранён: ${dst}"
+    fi
+}
+
 run_site_generator() {
     local script="$1"
     local gen_dir="${WORK_DIR}/gen-out"
+    local shim_dir="${WORK_DIR}/shims"
     local gen_log="${WORK_DIR}/generator.log"
     local marker="${WORK_DIR}/generator.marker"
-    local rc=0
+    local foreign_before="${WORK_DIR}/foreign-before"
+    local rc=0 unit
 
     mkdir -p "${gen_dir}"
     chmod 700 "${gen_dir}"
     cp "${script}" "${gen_dir}/generator.sh"
     chmod 700 "${gen_dir}/generator.sh"
+
     if ! bash -n "${gen_dir}/generator.sh" 2>"${WORK_DIR}/generator-syntax.log"; then
         cat "${WORK_DIR}/generator-syntax.log" >&2
         die "В bash-генераторе обнаружена синтаксическая ошибка."
     fi
+
+    create_generator_shims "${shim_dir}"
 
     # Генератору могут понадобиться пакеты: ждём освобождения apt и обновляем индекс.
     wait_for_apt
     apt-get update -qq >/dev/null 2>&1 || true
 
     snapshot_nginx
+
+    : > "${foreign_before}"
+    for unit in "${FOREIGN_WEB_UNITS[@]}"; do
+        if "${REAL_SYSTEMCTL}" is-active --quiet "${unit}" 2>/dev/null; then
+            echo "${unit}" >> "${foreign_before}"
+        fi
+    done
+
     touch "${marker}"
     sleep 1
 
     log "Запуск генератора от root (до ${GENERATOR_TIMEOUT} секунд, ввод отключён)..."
-    info "Вывод генератора сохраняется в лог. Он может ставить пакеты и скачивать файлы."
+    info "Вывод генератора сохраняется в лог. Команды nginx, ufw, certbot и systemctl для веб-серверов подменены."
 
     (
         cd "${gen_dir}"
         env \
             HOME=/root USER=root LOGNAME=root \
+            PATH="${shim_dir}:${PATH}" \
             DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=a NEEDRESTART_SUSPEND=1 \
             TERM=dumb \
             SITE_DOMAIN="${SITE_DOMAIN}" DOMAIN="${SITE_DOMAIN}" \
@@ -1326,9 +1471,12 @@ run_site_generator() {
             timeout --kill-after=20 "${GENERATOR_TIMEOUT}" bash "${gen_dir}/generator.sh" "${gen_dir}" </dev/null
     ) > "${gen_log}" 2>&1 || rc=$?
 
-    # Что бы ни сделал генератор, возвращаем nginx, UFW и дефолты до любых проверок.
+    # Что бы ни сделал генератор, возвращаем веб-сервер, фаервол и дефолты до любых проверок.
+    rm -f "${gen_dir}/generator.sh"
+    stop_new_foreign_web_servers "${foreign_before}"
     restore_nginx_if_changed
     ensure_firewall_after_generator
+    restart_nginx_checked
 
     if (( rc != 0 )); then
         tail -n 30 "${gen_log}" >&2 || true
@@ -1336,10 +1484,10 @@ run_site_generator() {
         if (( rc == 124 || rc == 137 )); then
             die "Генератор не завершился за ${GENERATOR_TIMEOUT} секунд. Возможно, он ждёт ввод."
         fi
-        die "Генератор сайта завершился с кодом ${rc}."
+        die "Генератор сайта завершился с кодом ${rc}. Лог сохранён."
     fi
 
-    check_ports_after_generator
+    check_web_ports || die "Посторонние процессы заняли порты 80/443. Остановите их и повторите установку."
     check_node_running
 
     if ! pick_site_source "${gen_dir}" "${marker}"; then
@@ -1348,11 +1496,10 @@ run_site_generator() {
         die "Генератор не создал ни одной HTML-страницы. Проверьте логику генератора и лог."
     fi
 
-    rm -f "${gen_dir}/generator.sh"
     log "Сайт сгенерирован: ${SITE_SOURCE_DIR}"
 }
 
-# Копирует сайт в рабочий каталог и проверяет его.
+# Копирует сайт в рабочий каталог, очищает его и проверяет.
 prepare_final_site() {
     local src="$1" final="${WORK_DIR}/final" links size_mb
 
@@ -1367,7 +1514,9 @@ prepare_final_site() {
         find "${final}" -type l -delete
     fi
 
-    find "${final}" -name '.git' -prune -exec rm -rf {} + 2>/dev/null || true
+    # Не публикуем служебные и секретные файлы.
+    find "${final}" \( -name '.git' -o -name '.env*' -o -name '*.key' -o -name '*.pem' \
+        -o -name 'node_modules' -o -name '*.sh' \) -prune -exec rm -rf {} + 2>/dev/null || true
 
     size_mb="$(du -sm "${final}" | awk '{print $1}')"
     (( size_mb < 200 )) || die "Сайт слишком большой: ${size_mb} МБ."
@@ -1435,12 +1584,13 @@ install_site() {
 
     prepare_final_site "${SITE_SOURCE_DIR}"
     install_final_site
+    "${REAL_SYSTEMCTL}" reload nginx >/dev/null 2>&1 || true
 }
 
 verify_site() {
     local code
     code="$(
-        curl -sk -o /dev/null -w '%{http_code}' \
+        curl -sk -o /dev/null -w '%{http_code}' --max-time 15 \
             --resolve "${SITE_DOMAIN}:8443:127.0.0.1" \
             "https://${SITE_DOMAIN}:8443/" || true
     )"
@@ -1449,37 +1599,19 @@ verify_site() {
     log "Сайт-заглушка отвечает на ${SITE_DOMAIN}."
 }
 
-restart_nginx_checked() {
-    if systemctl restart nginx; then
-        systemctl is-active --quiet nginx || die "Nginx не перешёл в active."
-        return 0
-    fi
-
-    warn "Nginx не запустился после изменения конфигурации. Откатываем последний конфиг."
-    local backup="${NGINX_BACKUP_DIR}/remnanode-selfsteal.conf.bak.${BACKUP_SUFFIX}"
-    if [[ -f "${backup}" ]]; then
-        cp -a "${backup}" "${NGINX_CONF}"
-    else
-        rm -f "${NGINX_CONF}"
-    fi
-    nginx -t || die "После отката конфигурация Nginx также не проходит проверку."
-    systemctl restart nginx || die "Не удалось восстановить предыдущий Nginx."
-    die "Новая конфигурация Nginx не применена; предыдущая восстановлена."
-}
-
 configure_selfsteal() {
     log "Настройка self-steal..."
     install_nginx
     install_generator_tools
     check_nginx_domain_conflicts
+
+    mkdir -p "${SITE_ROOT}/.well-known/acme-challenge"
     write_nginx_config http
-    nginx -t >/dev/null 2>&1 || die "Конфигурация nginx не прошла проверку."
     restart_nginx_checked
 
     issue_certificate
 
     write_nginx_config ssl
-    nginx -t >/dev/null 2>&1 || die "Финальный конфиг nginx не прошёл проверку."
     restart_nginx_checked
 
     install_site
@@ -1706,7 +1838,7 @@ show_block() {
     echo "========================================"
 }
 
-# Выводит профиль RU в терминал. Файлов с профилем не создаётся.
+# Выводит профиль в терминал. Файлов с профилем не создаётся.
 output_node_profile() {
     build_profile
 
