@@ -37,6 +37,7 @@ CASCADE_STATE_FILE="/root/remnanode-cascade.state"
 LEGACY_PROFILE_FILE="/root/remnanode-profile.json"
 
 BACKUP_SUFFIX="$(date +%Y%m%d-%H%M%S)"
+NGINX_BACKUP_DIR="/root/remnanode-backups"
 
 DOMAIN_RE='^([A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?\.)+[A-Za-z]{2,63}$'
 UUID_RE='^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$'
@@ -974,7 +975,9 @@ check_nginx_domain_conflicts() {
         [[ -d "${dir}" ]] || continue
         while IFS= read -r -d '' f; do
             [[ "${f}" == "${NGINX_CONF}" ]] && continue
-            if grep -qF -- "${SITE_DOMAIN}" "${f}" 2>/dev/null; then
+            [[ "$(basename "${f}")" == remnanode-* ]] && continue
+            if grep -qE "^[[:space:]]server_name[[:space:]].(^|[[:space:]])${SITE_DOMAIN//./\\.}([[:space:];]|$)" "${f}" 2>/dev/null ||
+               grep -qF "/etc/letsencrypt/live/${SITE_DOMAIN}/" "${f}" 2>/dev/null; then
                 warn "Найден конфиг Nginx с доменом ${SITE_DOMAIN}: ${f}"
                 die "Конфликт домена. Чужой конфиг не изменён. Устраните конфликт вручную или выберите другой домен."
             fi
@@ -985,15 +988,17 @@ check_nginx_domain_conflicts() {
 write_nginx_config() {
     local stage="$1"
     local tmp="${NGINX_CONF}.new.$$"
-    mkdir -p /etc/nginx/conf.d
+    local backup=""
+    mkdir -p /etc/nginx/conf.d "${NGINX_BACKUP_DIR}"
+    chmod 700 "${NGINX_BACKUP_DIR}"
 
     if [[ "${stage}" == "http" ]]; then
         cat > "${tmp}" <<'NGINX'
 server {
     listen 80;
     listen [::]:80;
-    server_name __DOMAIN__;
-    root __SITE_ROOT__;
+    server_name _DOMAIN_;
+    root _SITE_ROOT_;
     index index.html;
 
     location ^~ /.well-known/acme-challenge/ {
@@ -1010,8 +1015,8 @@ NGINX
 server {
     listen 80;
     listen [::]:80;
-    server_name __DOMAIN__;
-    root __SITE_ROOT__;
+    server_name _DOMAIN_;
+    root _SITE_ROOT_;
 
     location ^~ /.well-known/acme-challenge/ {
         try_files $uri =404;
@@ -1024,15 +1029,15 @@ server {
 
 server {
     listen 127.0.0.1:8443 ssl http2;
-    server_name __DOMAIN__;
+    server_name _DOMAIN_;
 
-    ssl_certificate     /etc/letsencrypt/live/__DOMAIN__/fullchain.pem;
-    ssl_certificate_key /etc/letsencrypt/live/__DOMAIN__/privkey.pem;
+    ssl_certificate     /etc/letsencrypt/live/_DOMAIN_/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/_DOMAIN_/privkey.pem;
     ssl_protocols TLSv1.2 TLSv1.3;
     ssl_session_cache shared:SSL:10m;
     ssl_session_timeout 1d;
 
-    root __SITE_ROOT__;
+    root _SITE_ROOT_;
     index index.html;
     add_header X-Content-Type-Options nosniff always;
 
@@ -1044,13 +1049,14 @@ NGINX
     fi
 
     sed -i \
-        -e "s|__DOMAIN__|${SITE_DOMAIN}|g" \
-        -e "s|__SITE_ROOT__|${SITE_ROOT}|g" \
+        -e "s|_DOMAIN_|${SITE_DOMAIN}|g" \
+        -e "s|_SITE_ROOT_|${SITE_ROOT}|g" \
         "${tmp}"
     chmod 644 "${tmp}"
 
     if [[ -f "${NGINX_CONF}" ]]; then
-        cp -a "${NGINX_CONF}" "${NGINX_CONF}.bak.${BACKUP_SUFFIX}"
+        backup="${NGINX_BACKUP_DIR}/remnanode-selfsteal.conf.bak.${BACKUP_SUFFIX}"
+        cp -a "${NGINX_CONF}" "${backup}"
         if [[ ! -e "${NGINX_PREBACKUP}" ]]; then
             cp -a "${NGINX_CONF}" "${NGINX_PREBACKUP}"
             chmod 600 "${NGINX_PREBACKUP}"
@@ -1059,8 +1065,8 @@ NGINX
     mv -f "${tmp}" "${NGINX_CONF}"
 
     if ! nginx -t >/dev/null 2>&1; then
-        if [[ -f "${NGINX_CONF}.bak.${BACKUP_SUFFIX}" ]]; then
-            cp -a "${NGINX_CONF}.bak.${BACKUP_SUFFIX}" "${NGINX_CONF}"
+        if [[ -n "${backup}" && -f "${backup}" ]]; then
+            cp -a "${backup}" "${NGINX_CONF}"
         else
             rm -f "${NGINX_CONF}"
         fi
@@ -1450,8 +1456,9 @@ restart_nginx_checked() {
     fi
 
     warn "Nginx не запустился после изменения конфигурации. Откатываем последний конфиг."
-    if [[ -f "${NGINX_CONF}.bak.${BACKUP_SUFFIX}" ]]; then
-        cp -a "${NGINX_CONF}.bak.${BACKUP_SUFFIX}" "${NGINX_CONF}"
+    local backup="${NGINX_BACKUP_DIR}/remnanode-selfsteal.conf.bak.${BACKUP_SUFFIX}"
+    if [[ -f "${backup}" ]]; then
+        cp -a "${backup}" "${NGINX_CONF}"
     else
         rm -f "${NGINX_CONF}"
     fi
