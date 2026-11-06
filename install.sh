@@ -5,14 +5,11 @@
 #
 set -Eeuo pipefail
 
-INSTALLER_VERSION="1.5.0"
+INSTALLER_VERSION="1.6.0"
 INSTALLER_URL="https://raw.githubusercontent.com/Wanderer-95/remnanode-installer/main/install.sh"
 
 export DEBIAN_FRONTEND=noninteractive
 export NEEDRESTART_MODE=a
-
-# 1 — режим для запуска на EU по SSH (без вопросов, ответы берутся из переменных)
-NONINTERACTIVE="${NONINTERACTIVE:-0}"
 
 INSTALL_DIR="/opt/remnanode"
 CONTAINER_NAME="remnanode"
@@ -28,10 +25,6 @@ JOURNALD_DROPIN="/etc/systemd/journald.conf.d/99-remnanode.conf"
 
 NGINX_CONF="/etc/nginx/conf.d/remnanode-selfsteal.conf"
 SITE_ROOT="/var/www/html"
-
-# Файлы, которые RU забирает с EU после установки
-NODE_OUT_FILE="/root/remnanode-node-out.env"
-PROFILE_OUT_FILE="/root/remnanode-profile.json"
 
 BACKUP_SUFFIX="$(date +%Y%m%d-%H%M%S)"
 
@@ -59,7 +52,6 @@ INBOUND_NAME=""
 SITE_DOMAIN=""
 SITE_FILE=""
 PASTE_TMP=""
-WORK_DIR=""
 NGINX_VERSION=""
 
 PRIVATE_KEY=""
@@ -67,19 +59,11 @@ PUBLIC_KEY=""
 SHORT_ID=""
 PROFILE_JSON=""
 
-EU_HOST=""
-EU_SSH_USER=""
-EU_SSH_PORT=""
-EU_TARGET=""
 EU_SITE_DOMAIN=""
 EU_INBOUND_NAME=""
-EU_SECRET_KEY=""
 EU_UUID=""
-EU_RESTART_CONFIRM=""
-EU_RUNNING=0
 EU_PUBLIC_KEY=""
 EU_SHORT_ID=""
-EU_PROFILE_JSON=""
 
 # ============================================================
 # LOGGING, CLEANUP
@@ -102,30 +86,17 @@ cleanup() {
     if [[ -n "${PASTE_TMP}" && -f "${PASTE_TMP}" ]]; then
         rm -f "${PASTE_TMP}"
     fi
-    if [[ -n "${WORK_DIR}" && -d "${WORK_DIR}" ]]; then
-        rm -rf "${WORK_DIR}"
-    fi
-    if (( NONINTERACTIVE == 1 )); then
-        # На EU после установки удаляем всё, что передал RU, кроме файлов с результатами.
-        rm -f /root/remnanode-install.sh /root/remnanode-site-in.html
-    fi
     return 0
 }
 trap cleanup EXIT
 
 # ============================================================
 # INPUT HELPERS
-# В интерактивном режиме спрашивают, в NONINTERACTIVE берут из переменных.
 # ============================================================
 
 # ask VAR "подсказка" [secret]
 ask() {
     local var="$1" prompt="$2" secret="${3:-0}" value=""
-
-    if (( NONINTERACTIVE == 1 )); then
-        [[ -n "${!var:-}" ]] || die "В неинтерактивном режиме не задано: ${var}."
-        return 0
-    fi
 
     while true; do
         if [[ "${secret}" == "1" ]]; then
@@ -152,9 +123,6 @@ ask_valid() {
         if [[ "${!var}" =~ ${re} ]]; then
             return 0
         fi
-        if (( NONINTERACTIVE == 1 )); then
-            die "Неверное значение ${var}."
-        fi
         warn "${msg}"
         printf -v "${var}" '%s' ''
     done
@@ -163,11 +131,6 @@ ask_valid() {
 # ask_secret_confirmed VAR "подсказка" — секрет вводится дважды
 ask_secret_confirmed() {
     local var="$1" prompt="$2" again=""
-
-    if (( NONINTERACTIVE == 1 )); then
-        ask "${var}" "${prompt}" 1
-        return 0
-    fi
 
     while true; do
         ask "${var}" "${prompt}" 1
@@ -188,9 +151,7 @@ ask_secret_confirmed() {
 check_system() {
     [[ "${EUID}" -eq 0 ]] || die "Запустите установщик от root."
 
-    if (( NONINTERACTIVE == 0 )) && [[ ! -t 0 ]]; then
-        die "Нужен интерактивный терминал."
-    fi
+    [[ -t 0 ]] || die "Нужен интерактивный терминал."
 
     [[ -f /etc/os-release ]] || die "Не удалось определить ОС."
     # shellcheck disable=SC1091
@@ -199,9 +160,6 @@ check_system() {
     [[ "${ID:-}" == "ubuntu" ]] || die "Поддерживается только Ubuntu."
 
     if [[ "${VERSION_ID:-}" != "24.04" ]]; then
-        if (( NONINTERACTIVE == 1 )); then
-            die "Нужна Ubuntu 24.04."
-        fi
         warn "Рекомендуется Ubuntu 24.04. Текущая версия: ${VERSION_ID:-unknown}"
         local answer=""
         read -r -p "Продолжить? [y/N]: " answer
@@ -224,14 +182,12 @@ apply_type() {
 select_reinstall() {
     REINSTALL=1
 
-    if (( NONINTERACTIVE == 0 )); then
-        echo
-        echo "Тип установки после переустановки:"
-        echo "1) Без self-steal"
-        echo "2) С self-steal"
-        echo "3) Каскад RU -> EU"
-        echo
-    fi
+    echo
+    echo "Тип установки после переустановки:"
+    echo "1) Без self-steal"
+    echo "2) С self-steal"
+    echo "3) Каскад RU -> EU"
+    echo
 
     ask REINSTALL_TYPE "Выберите тип [1/2/3]: "
     apply_type "${REINSTALL_TYPE}"
@@ -243,20 +199,18 @@ select_reinstall() {
 }
 
 select_mode() {
-    if (( NONINTERACTIVE == 0 )); then
-        echo
-        echo "========================================"
-        echo "       REMNAWAVE NODE INSTALLER"
-        echo "            v${INSTALLER_VERSION}"
-        echo "========================================"
-        echo
-        echo "1) Установка без self-steal"
-        echo "2) Установка с self-steal"
-        echo "3) Каскад RU -> EU (с self-steal)"
-        echo "4) Удалить Remnawave Node и установить заново"
-        echo "0) Выход"
-        echo
-    fi
+    echo
+    echo "========================================"
+    echo "       REMNAWAVE NODE INSTALLER"
+    echo "            v${INSTALLER_VERSION}"
+    echo "========================================"
+    echo
+    echo "1) Установка без self-steal"
+    echo "2) Установка с self-steal"
+    echo "3) Каскад RU -> EU (с self-steal)"
+    echo "4) Удалить Remnawave Node и установить заново"
+    echo "0) Выход"
+    echo
 
     ask MENU_ACTION "Выберите действие: "
 
@@ -318,7 +272,7 @@ backup_file() {
 # ============================================================
 
 read_secret_key() {
-    if (( NONINTERACTIVE == 0 )) && [[ -n "${EXISTING_SECRET_KEY}" ]]; then
+    if [[ -n "${EXISTING_SECRET_KEY}" ]]; then
         echo
         info "Найден SECRET_KEY от предыдущей установки."
         local choice=""
@@ -328,11 +282,6 @@ read_secret_key() {
             log "Используется существующий SECRET_KEY."
             return 0
         fi
-    fi
-
-    if (( NONINTERACTIVE == 1 )); then
-        [[ -n "${SECRET_KEY}" ]] || die "SECRET_KEY не передан."
-        return 0
     fi
 
     ask_secret_confirmed SECRET_KEY "SECRET_KEY Remnawave Node из панели (ввод скрыт): "
@@ -349,10 +298,6 @@ collect_site() {
     if [[ -n "${SITE_FILE}" ]]; then
         [[ -s "${SITE_FILE}" ]] || die "Файл сайта не найден или пустой: ${SITE_FILE}"
         return 0
-    fi
-
-    if (( NONINTERACTIVE == 1 )); then
-        die "Не задан SITE_FILE."
     fi
 
     echo
@@ -384,61 +329,15 @@ ask_restart_if_needed() {
     fi
 }
 
-ssh_eu() {
-    ssh -o BatchMode=yes -o ConnectTimeout=15 -o StrictHostKeyChecking=accept-new \
-        -p "${EU_SSH_PORT}" "${EU_TARGET}" "$@"
-}
-
-scp_eu() {
-    scp -q -P "${EU_SSH_PORT}" -o BatchMode=yes -o StrictHostKeyChecking=accept-new "$@"
-}
-
-check_eu_access() {
-    info "Проверка SSH-доступа к ${EU_TARGET}..."
-    ssh_eu true || die "Нет SSH-доступа по ключу. Выполните: ssh-copy-id -p ${EU_SSH_PORT} ${EU_TARGET}"
-
-    local os_info
-    os_info="$(ssh_eu '. /etc/os-release && echo "$ID $VERSION_ID"')" ||
-        die "Не удалось прочитать версию ОС на EU."
-    [[ "${os_info}" == "ubuntu 24.04" ]] ||
-        die "На EU нужна Ubuntu 24.04, найдено: ${os_info}"
-
-    local exists
-    exists="$(ssh_eu 'if [ -e /opt/remnanode ] || docker container inspect remnanode >/dev/null 2>&1; then echo yes; else echo no; fi')" ||
-        die "Не удалось проверить EU."
-    [[ "${exists}" == "no" ]] ||
-        die "На EU уже есть Remnawave Node. Каскад ставится только на чистый сервер."
-
-    local count
-    count="$(ssh_eu 'if command -v docker >/dev/null 2>&1; then docker ps -q | wc -l; else echo 0; fi')" ||
-        die "Не удалось проверить контейнеры на EU."
-    count="${count//[[:space:]]/}"
-    [[ "${count}" =~ ^[0-9]+$ ]] || die "Некорректный ответ от EU."
-    EU_RUNNING="${count}"
-
-    if (( EU_RUNNING > 0 )); then
-        warn "На EU запущено контейнеров: ${EU_RUNNING}. Перезапуск Docker на EU их прервёт."
-        ask_valid EU_RESTART_CONFIRM "Для перезапуска Docker на EU введите RESTART: " '^RESTART$' "Введите RESTART."
-    fi
-
-    log "EU доступен и готов к установке."
-}
-
 ask_cascade_params() {
     echo
-    info "Параметры EU-сервера. RU зайдёт на него по SSH-ключу и установит там ноду."
+    info "Параметры EU-ноды. Скрипт не заходит на EU сам: эти данные нужны для профиля RU"
+    info "и для инструкции, которую вы выполните на EU вручную."
 
-    ask_valid EU_HOST "IP или домен EU-сервера: " '^[A-Za-z0-9.:-]+$' "Некорректный адрес."
-    ask_valid EU_SSH_USER "SSH-пользователь на EU (обычно root): " '^[a-z_][a-z0-9_-]*$' "Некорректное имя пользователя."
-    ask_valid EU_SSH_PORT "SSH-порт на EU (обычно 22): " '^[0-9]{1,5}$' "Некорректный порт."
-    ask_valid EU_SITE_DOMAIN "Домен EU-ноды (self-steal, A-запись на EU): " "${DOMAIN_RE}" "Некорректный домен."
+    ask_valid EU_SITE_DOMAIN "Домен EU-ноды (A-запись на EU): " "${DOMAIN_RE}" "Некорректный домен."
     EU_SITE_DOMAIN="${EU_SITE_DOMAIN,,}"
-    ask_valid EU_UUID "UUID пользователя на EU (с flow xtls-rprx-vision): " "${UUID_RE}" "Некорректный UUID."
-    ask_secret_confirmed EU_SECRET_KEY "SECRET_KEY EU-ноды из её панели (ввод скрыт): "
+    ask_valid EU_UUID "UUID пользователя для RU на EU (flow xtls-rprx-vision): " "${UUID_RE}" "Некорректный UUID."
     ask EU_INBOUND_NAME "Название инбаунда на EU (например, DE_IN): "
-
-    EU_TARGET="${EU_SSH_USER}@${EU_HOST}"
-    check_eu_access
 }
 
 collect_answers() {
@@ -1061,6 +960,39 @@ configure_selfsteal() {
 }
 
 # ============================================================
+# CASCADE: MANUAL STEP ON EU
+# ============================================================
+
+cascade_show_eu_instructions() {
+    local text
+    text="$(cat <<EOF
+1. Зайдите по SSH на EU-сервер (${EU_SITE_DOMAIN}). Сервер должен быть чистым, Ubuntu 24.04.
+2. Выполните команду:
+   bash <(curl -fsSL ${INSTALLER_URL})
+3. Выберите пункт 2 (установка с self-steal).
+4. Введите данные по запросам:
+   - SECRET_KEY EU-ноды из панели Remnawave;
+   - домен: ${EU_SITE_DOMAIN};
+   - название инбаунда: ${EU_INBOUND_NAME};
+   - сайт-заглушка (вставьте HTML или Bash-генератор, затем Ctrl+D).
+5. В конце установщик покажет PublicKey и Short ID. Скопируйте их, они понадобятся на RU.
+6. Из вывода установщика на EU возьмите PROFILE и вставьте его в конфиг-профиль панели Remnawave для EU-ноды.
+7. В этом же профиле или в панели добавьте пользователя с UUID ${EU_UUID} и flow xtls-rprx-vision.
+8. Вернитесь на RU-сервер. Скрипт будет ждать ввода PublicKey и Short ID с EU.
+EOF
+)"
+    show_block "ДЕЙСТВИЕ НА EU-СЕРВЕРЕ" "${text}"
+}
+
+cascade_ask_eu_keys() {
+    echo
+    info "Введите данные, которые EU-установщик вывел в конце."
+    ask_valid EU_PUBLIC_KEY "PublicKey с EU: " "${PUBKEY_RE}" "Некорректный PublicKey (43 символа)."
+    ask_valid EU_SHORT_ID "Short ID с EU: " "${SHORTID_RE}" "Некорректный Short ID (hex, 2-16 символов)."
+    log "Данные EU приняты."
+}
+
+# ============================================================
 # PROFILE
 # ============================================================
 
@@ -1183,98 +1115,13 @@ show_block() {
     echo "========================================"
 }
 
-save_remote_outputs() {
-    # Режим EU, которым управляет RU: файлы забирает RU и сразу удаляет.
-    umask 077
-    printf '%s\n' "${PROFILE_JSON}" > "${PROFILE_OUT_FILE}"
-    printf 'NODE_PUBLIC_KEY=%s\nNODE_SHORT_ID=%s\n' "${PUBLIC_KEY}" "${SHORT_ID}" > "${NODE_OUT_FILE}"
-    chmod 600 "${PROFILE_OUT_FILE}" "${NODE_OUT_FILE}"
-}
-
 output_profiles() {
-    if (( NONINTERACTIVE == 1 )); then
-        save_remote_outputs
-        log "Профиль и публичный ключ сохранены для RU."
-        return 0
-    fi
+    show_block "PUBLIC KEY и SHORT ID (для клиентских конфигов)" \
+        "PublicKey: ${PUBLIC_KEY}"$'\n'"Short ID:   ${SHORT_ID}"
 
-    if (( CASCADE == 1 )); then
-        show_block "PROFILE EU-НОДЫ (вставить в панель для EU)" "${EU_PROFILE_JSON}"
-        info "Public key EU: ${EU_PUBLIC_KEY}"
-    fi
-
-    show_block "PROFILE RU-НОДЫ (вставить в панель для RU)" "${PROFILE_JSON}"
-    warn "Профили содержат приватные ключи. Не публикуйте их."
+    show_block "PROFILE ЭТОЙ НОДЫ (вставить в панель)" "${PROFILE_JSON}"
+    warn "Профиль содержит приватный ключ. Не публикуйте его."
     PROFILE_JSON=""
-}
-
-# ============================================================
-# CASCADE: REMOTE INSTALL ON EU
-# ============================================================
-
-run_cascade_remote() {
-    echo
-    log "Подготовка установки на EU (${EU_TARGET})..."
-
-    WORK_DIR="$(mktemp -d)"
-    chmod 700 "${WORK_DIR}"
-    umask 077
-
-    # На EU уходит та же версия скрипта, которую запустил RU.
-    # Если скрипт запущен через bash <(curl ...), файла нет, и он скачивается заново.
-    if [[ -f "${BASH_SOURCE[0]}" ]]; then
-        cp "${BASH_SOURCE[0]}" "${WORK_DIR}/install.sh"
-    else
-        curl -fsSL "${INSTALLER_URL}" -o "${WORK_DIR}/install.sh" ||
-            die "Не удалось скачать install.sh для передачи на EU."
-    fi
-
-    local answers="${WORK_DIR}/answers.env"
-    {
-        echo "NONINTERACTIVE=1"
-        echo "MENU_ACTION=2"
-        echo "RESTART_CONFIRM=RESTART"
-        printf 'SECRET_KEY=%q\n' "${EU_SECRET_KEY}"
-        printf 'SITE_DOMAIN=%q\n' "${EU_SITE_DOMAIN}"
-        printf 'INBOUND_NAME=%q\n' "${EU_INBOUND_NAME}"
-        echo "SITE_FILE=/root/remnanode-site-in.html"
-    } > "${answers}"
-
-    log "Копирование установщика, ответов и сайта на EU..."
-    scp_eu "${WORK_DIR}/install.sh" "${EU_TARGET}:/root/remnanode-install.sh" ||
-        die "Не удалось скопировать install.sh на EU."
-    scp_eu "${answers}" "${EU_TARGET}:/root/remnanode-answers.env" ||
-        die "Не удалось скопировать ответы на EU."
-    scp_eu "${SITE_FILE}" "${EU_TARGET}:/root/remnanode-site-in.html" ||
-        die "Не удалось скопировать сайт на EU."
-    rm -f "${answers}"
-
-    log "Установка на EU. Это займёт несколько минут..."
-    ssh_eu 'set -e
-        chmod 700 /root/remnanode-install.sh
-        chmod 600 /root/remnanode-answers.env
-        set -a
-        . /root/remnanode-answers.env
-        set +a
-        rm -f /root/remnanode-answers.env
-        bash /root/remnanode-install.sh </dev/null' ||
-        die "Установка на EU завершилась с ошибкой. На EU: docker logs remnanode --tail 100"
-
-    local node_out
-    node_out="$(ssh_eu 'cat /root/remnanode-node-out.env && rm -f /root/remnanode-node-out.env')" ||
-        die "Не удалось получить параметры EU."
-    EU_PROFILE_JSON="$(ssh_eu 'cat /root/remnanode-profile.json && rm -f /root/remnanode-profile.json')" ||
-        die "Не удалось получить профиль EU."
-
-    EU_PUBLIC_KEY="$(sed -n 's/^NODE_PUBLIC_KEY=//p' <<< "${node_out}")"
-    EU_SHORT_ID="$(sed -n 's/^NODE_SHORT_ID=//p' <<< "${node_out}")"
-
-    [[ "${EU_PUBLIC_KEY}" =~ ${PUBKEY_RE} ]] || die "Некорректный public key EU."
-    [[ "${EU_SHORT_ID}" =~ ${SHORTID_RE} ]] || die "Некорректный short ID EU."
-
-    rm -rf "${WORK_DIR}"
-    WORK_DIR=""
-    log "EU установлен. Публичный ключ и short ID получены."
 }
 
 # ============================================================
@@ -1303,7 +1150,7 @@ show_result() {
         log "nginx: ${NGINX_VERSION}"
     fi
     if (( CASCADE == 1 )); then
-        log "EU: ${EU_SITE_DOMAIN} (${EU_TARGET})"
+        log "EU: ${EU_SITE_DOMAIN}"
     fi
     if [[ -n "${MAIN_INTERFACE}" ]]; then
         echo "Network interface: ${MAIN_INTERFACE}"
@@ -1355,17 +1202,22 @@ main() {
     create_configuration
     start_node
 
-    if (( CASCADE == 1 )); then
-        run_cascade_remote
-    fi
-
     if (( SELFSTEAL == 1 )); then
         configure_selfsteal
         generate_keys
-        build_profile
-        output_profiles
     else
         generate_parameters
+    fi
+
+    if (( CASCADE == 1 )); then
+        log "Часть для RU готова. Дальше нужно действие на EU."
+        cascade_show_eu_instructions
+        cascade_ask_eu_keys
+    fi
+
+    if (( SELFSTEAL == 1 )); then
+        build_profile
+        output_profiles
     fi
 
     show_result
