@@ -5,7 +5,7 @@
 #
 set -Eeuo pipefail
 
-INSTALLER_VERSION="1.7.0"
+INSTALLER_VERSION="1.8.0"
 INSTALLER_URL="https://raw.githubusercontent.com/Wanderer-95/remnanode-installer/main/install.sh"
 
 export DEBIAN_FRONTEND=noninteractive
@@ -24,7 +24,9 @@ DOCKER_DAEMON_JSON="/etc/docker/daemon.json"
 JOURNALD_DROPIN="/etc/systemd/journald.conf.d/99-remnanode.conf"
 
 NGINX_CONF="/etc/nginx/conf.d/remnanode-selfsteal.conf"
+NGINX_BACKUP_BASE="/root/remnanode-nginx-backup"
 SITE_ROOT="/var/www/html"
+GENERATOR_TIMEOUT=900
 
 # Состояние каскада пишется на RU, пока ждём данные с EU.
 # Содержит приватный ключ RU, права 600. Удаляется после подтверждения Enter.
@@ -61,6 +63,10 @@ SITE_FILE=""
 PASTE_TMP=""
 NGINX_VERSION=""
 
+WORK_DIR=""
+NGINX_SNAPSHOT=""
+SITE_SOURCE_DIR=""
+
 PRIVATE_KEY=""
 PUBLIC_KEY=""
 SHORT_ID=""
@@ -92,6 +98,9 @@ trap 'die "Ошибка на строке ${LINENO}. Проверьте выво
 cleanup() {
     if [[ -n "${PASTE_TMP}" && -f "${PASTE_TMP}" ]]; then
         rm -f "${PASTE_TMP}"
+    fi
+    if [[ -n "${WORK_DIR}" && -d "${WORK_DIR}" ]]; then
+        rm -rf "${WORK_DIR}"
     fi
     PROFILE_JSON=""
     return 0
@@ -310,13 +319,15 @@ ask_selfsteal_domain() {
 }
 
 collect_site() {
-    if [[ -n "${SITE_FILE}" ]]; then
-        [[ -s "${SITE_FILE}" ]] || die "Файл сайта не найден или пустой: ${SITE_FILE}"
-        return 0
-    fi
-
     echo
-    info "Вставьте сайт целиком (HTML или Bash-генератор), затем на новой строке нажмите Ctrl+D."
+    info "Сайт-заглушка можно передать двумя способами:"
+    info " - HTML-страница (начинается с <!DOCTYPE html> или <html>);"
+    info " - bash-генератор, первая строка которого #!/bin/bash."
+    info "Генератор не должен задавать вопросов и должен писать сайт в каталог из первого аргумента \$1"
+    info "(также доступен в переменных OUT_DIR, SITE_ROOT, WEB_ROOT). Генератор не должен настраивать nginx:"
+    info "установщик настроит его сам, а любые изменения nginx откатываются."
+    info "Вставьте сайт целиком, затем на новой строке нажмите Ctrl+D."
+
     PASTE_TMP="$(mktemp /tmp/remnanode-site.XXXXXX)"
     chmod 600 "${PASTE_TMP}"
     cat > "${PASTE_TMP}"
@@ -401,7 +412,7 @@ remove_remnanode() {
         log "Удалён каталог ${INSTALL_DIR}."
     fi
 
-    # Старые файлы с приватными ключами: состояние каскада и профиль из версий до 1.9.0.
+    # Файлы с приватными ключами и старый профиль из версий до 1.9.0.
     rm -f "${NGINX_CONF}" "${CASCADE_STATE_FILE}" "${LEGACY_PROFILE_FILE}"
 
     if systemctl is-active --quiet nginx; then
@@ -603,7 +614,7 @@ EOF
     log "Лимиты Docker записаны."
 }
 
-# daemon.json сначала пишется во временный файл и проверяется.
+# daemon.json сначала собирается во временный файл и проверяется.
 # Боевой файл заменяется только после успешной проверки, иначе Docker не поднимется.
 configure_docker_logging() {
     log "Настройка Docker logging..."
@@ -878,6 +889,32 @@ install_nginx() {
     log "nginx ${NGINX_VERSION} установлен."
 }
 
+# Удаляет чужие конфиги nginx, которые описывают тот же домен.
+# Остались, например, от генератора сайта в прошлом запуске и дают conflicting server name.
+# Копии сохраняются в каталог резервных копий.
+remove_foreign_nginx_configs() {
+    local dir f backup="${NGINX_BACKUP_BASE}.${BACKUP_SUFFIX}"
+
+    for dir in /etc/nginx/conf.d /etc/nginx/sites-enabled; do
+        [[ -d "${dir}" ]] || continue
+        while IFS= read -r f; do
+            [[ -n "${f}" ]] || continue
+            [[ "${f}" == "${NGINX_CONF}" ]] && continue
+            if grep -qF "${SITE_DOMAIN}" "${f}" 2>/dev/null; then
+                mkdir -p "${backup}"
+                mv "${f}" "${backup}/"
+                warn "Удалён конфликтующий конфиг nginx: ${f} (копия: ${backup}/)"
+            fi
+        done < <(find "${dir}" -mindepth 1 -maxdepth 1 \( -type f -o -type l \) | sort)
+    done
+
+    if [[ -e /etc/nginx/sites-enabled/default || -L /etc/nginx/sites-enabled/default ]]; then
+        mkdir -p "${backup}"
+        mv /etc/nginx/sites-enabled/default "${backup}/"
+        warn "Отключён default-сайт nginx (копия: ${backup}/)."
+    fi
+}
+
 write_nginx_config() {
     local stage="$1"
     mkdir -p /etc/nginx/conf.d
@@ -954,28 +991,303 @@ issue_certificate() {
     log "Сертификат получен."
 }
 
-install_site() {
-    [[ -n "${SITE_FILE}" && -s "${SITE_FILE}" ]] || die "Файл сайта не найден: ${SITE_FILE}"
-    mkdir -p "${SITE_ROOT}"
+# ============================================================
+# SITE: INPUT, GENERATOR, INSTALL
+# ============================================================
 
-    local first_line
-    first_line="$(sed -n '/[^[:space:]]/{p;q;}' "${SITE_FILE}")"
+# Приводит файл к виду без BOM и без CRLF.
+normalize_site_input() {
+    local src="$1" dst="$2"
+    python3 - "${src}" "${dst}" <<'PY'
+import sys
 
-    if [[ "${first_line}" == '#!'* ]]; then
-        log "Обнаружен Bash-генератор сайта. Выполнение..."
-        bash "${SITE_FILE}" "${SITE_ROOT}" || die "Генератор сайта завершился с ошибкой."
-    elif grep -qiE '<!doctype html|<html' "${SITE_FILE}"; then
-        cp "${SITE_FILE}" "${SITE_ROOT}/index.html"
-        log "HTML-страница сохранена как index.html."
-    else
-        die "Не удалось распознать сайт: нужен HTML или Bash-генератор."
+src, dst = sys.argv[1], sys.argv[2]
+with open(src, "rb") as f:
+    data = f.read()
+if data.startswith(b"\xef\xbb\xbf"):
+    data = data[3:]
+data = data.replace(b"\r\n", b"\n")
+with open(dst, "wb") as f:
+    f.write(data)
+PY
+    chmod 600 "${dst}"
+}
+
+# Печатает тип файла: bash, html, unsupported-shebang или unknown.
+detect_site_kind() {
+    local file="$1" first
+    first="$(sed -n '/[^[:space:]]/{p;q;}' "${file}")"
+
+    if [[ "${first}" == '#!'* ]]; then
+        if [[ "${first}" =~ ^#!.*(bash|/sh)([[:space:]]|$) ]]; then
+            echo "bash"
+        else
+            echo "unsupported-shebang"
+        fi
+        return 0
     fi
 
-    [[ -f "${SITE_ROOT}/index.html" ]] || die "После установки сайта нет index.html в ${SITE_ROOT}."
+    if [[ "${first}" =~ ^[[:space:]]*\< ]] &&
+       grep -qiE '<!doctype[[:space:]]+html|<html|<head|<body' "${file}"; then
+        echo "html"
+        return 0
+    fi
 
+    echo "unknown"
+}
+
+# Список всех index.html с отметкой времени и размером, отсортированный для comm.
+index_snapshot() {
+    local out="$1"
+    LC_ALL=C find /var/www /srv /opt /root /home /tmp /var/tmp \
+        -maxdepth 5 -path "${INSTALL_DIR}" -prune -o \
+        -type f -name index.html -printf '%p|%T@|%s\n' 2>/dev/null |
+        LC_ALL=C sort > "${out}" || true
+}
+
+# Полный снимок /etc/nginx до запуска генератора.
+snapshot_nginx() {
+    NGINX_SNAPSHOT="${WORK_DIR}/nginx-snapshot"
+    rm -rf "${NGINX_SNAPSHOT}"
+    cp -a /etc/nginx "${NGINX_SNAPSHOT}"
+}
+
+# Если генератор изменил nginx, возвращаем снимок целиком и проверяем конфиг.
+restore_nginx_if_changed() {
+    local diffs=""
+    diffs="$(diff -rq /etc/nginx "${NGINX_SNAPSHOT}" 2>/dev/null || true)"
+    if [[ -z "${diffs}" ]]; then
+        return 0
+    fi
+
+    warn "Генератор изменил конфигурацию nginx. Изменения откатываются:"
+    printf '%s\n' "${diffs}" | sed 's/^/    /' >&2
+
+    rm -rf /etc/nginx
+    cp -a "${NGINX_SNAPSHOT}" /etc/nginx
+    nginx -t >/dev/null 2>&1 || die "После отката конфиг nginx не проходит проверку."
+    systemctl restart nginx || die "Не удалось перезапустить nginx после отката."
+    log "Конфиг nginx возвращён к состоянию до генератора."
+}
+
+# Сохраняет лог генератора в /root, чтобы его можно было посмотреть после очистки.
+keep_generator_log() {
+    local src="$1" dst="/root/remnanode-generator-${BACKUP_SUFFIX}.log"
+    if [[ -f "${src}" ]]; then
+        cp -p "${src}" "${dst}"
+        chmod 600 "${dst}"
+        warn "Лог генератора сохранён: ${dst}"
+    fi
+}
+
+# Проверяет, что посторонний сервис не занял 80 или 443.
+check_ports_after_generator() {
+    local owners=""
+    owners="$(
+        ss -tlnp 2>/dev/null |
+        awk 'NR>1 && $4 ~ /:(80|443)$/' |
+        { grep -vE '"(nginx|xray|docker-proxy)"' || true; }
+    )"
+
+    if [[ -n "${owners}" ]]; then
+        warn "На портах 80 или 443 работает посторонний сервис:"
+        printf '%s\n' "${owners}" >&2
+        die "Генератор поднял свой веб-сервер. Сайт должен отдаваться через nginx установщика."
+    fi
+}
+
+check_node_running() {
+    local status
+    status="$(docker inspect -f '{{.State.Status}}' "${CONTAINER_NAME}" 2>/dev/null || true)"
+    [[ "${status}" == "running" ]] ||
+        die "Контейнер ноды не в статусе running после генератора (статус: ${status:-unknown})."
+}
+
+# Выбирает каталог, где лежит готовый сайт. Результат пишется в SITE_SOURCE_DIR.
+pick_site_source() {
+    local gen_dir="$1" changed="$2"
+    local -a cands=()
+    local c best="" html
+
+    while IFS= read -r c; do
+        if [[ -n "${c}" ]]; then
+            cands+=("${c}")
+        fi
+    done <<< "${changed}"
+
+    if [[ -f "${gen_dir}/index.html" ]]; then
+        SITE_SOURCE_DIR="${gen_dir}"
+        return 0
+    fi
+
+    for c in "${cands[@]}"; do
+        if [[ "${c}" == *"${SITE_DOMAIN}"* ]]; then
+            best="${c}"
+            break
+        fi
+    done
+
+    if [[ -z "${best}" ]]; then
+        for c in "${cands[@]}"; do
+            if [[ "${c}" == "${SITE_ROOT}/index.html" ]]; then
+                best="${c}"
+                break
+            fi
+        done
+    fi
+
+    if [[ -z "${best}" && ${#cands[@]} -gt 0 ]]; then
+        best="${cands[0]}"
+    fi
+
+    if (( ${#cands[@]} > 1 )); then
+        warn "Генератор создал несколько index.html. Используется: ${best}"
+    fi
+
+    if [[ -n "${best}" ]]; then
+        SITE_SOURCE_DIR="$(dirname "${best}")"
+        return 0
+    fi
+
+    # Index.html не найден, но есть другая HTML-страница: переименовываем её.
+    html="$(find "${gen_dir}" -maxdepth 3 -type f -name '*.html' 2>/dev/null | sort | head -n1 || true)"
+    if [[ -n "${html}" ]]; then
+        cp "${html}" "${gen_dir}/index.html"
+        warn "Генератор не создал index.html. Страница ${html} использована как index.html."
+        SITE_SOURCE_DIR="${gen_dir}"
+        return 0
+    fi
+
+    return 1
+}
+
+run_site_generator() {
+    local script="$1"
+    local gen_dir="${WORK_DIR}/gen-out"
+    local gen_log="${WORK_DIR}/generator.log"
+    local rc=0 changed=""
+
+    mkdir -p "${gen_dir}"
+    cp "${script}" "${WORK_DIR}/generator.sh"
+    chmod 600 "${WORK_DIR}/generator.sh"
+
+    index_snapshot "${WORK_DIR}/index.before"
+    snapshot_nginx
+
+    log "Запуск генератора сайта (до ${GENERATOR_TIMEOUT} секунд, ввод с клавиатуры отключён)..."
+
+    (
+        cd "${gen_dir}"
+        export SITE_DOMAIN
+        export OUT_DIR="${gen_dir}" SITE_OUT="${gen_dir}" WEB_ROOT="${gen_dir}" SITE_ROOT="${gen_dir}"
+        timeout --kill-after=20 "${GENERATOR_TIMEOUT}" bash "${WORK_DIR}/generator.sh" "${gen_dir}" </dev/null
+    ) > "${gen_log}" 2>&1 || rc=$?
+
+    if (( rc != 0 )); then
+        restore_nginx_if_changed
+        tail -n 30 "${gen_log}" >&2 || true
+        keep_generator_log "${gen_log}"
+        if (( rc == 124 || rc == 137 )); then
+            die "Генератор не завершился за ${GENERATOR_TIMEOUT} секунд. Возможно, он ждёт ввод."
+        fi
+        die "Генератор сайта завершился с кодом ${rc}."
+    fi
+
+    restore_nginx_if_changed
+    check_ports_after_generator
+    check_node_running
+
+    index_snapshot "${WORK_DIR}/index.after"
+    changed="$(LC_ALL=C comm -13 "${WORK_DIR}/index.before" "${WORK_DIR}/index.after" | cut -d'|' -f1 || true)"
+
+    if ! pick_site_source "${gen_dir}" "${changed}"; then
+        keep_generator_log "${gen_log}"
+        die "Генератор не создал ни одной HTML-страницы. Проверьте логику генератора и лог."
+    fi
+
+    log "Сайт сгенерирован: ${SITE_SOURCE_DIR}"
+}
+
+# Копирует сайт в рабочий каталог и проверяет его.
+prepare_final_site() {
+    local src="$1" final="${WORK_DIR}/final" links size_mb
+
+    rm -rf "${final}"
+    mkdir -p "${final}"
+    cp -a "${src}/." "${final}/"
+
+    links="$(find "${final}" -type l | wc -l)"
+    links="${links//[[:space:]]/}"
+    if (( links > 0 )); then
+        warn "Удаляем символические ссылки в сайте: ${links} шт."
+        find "${final}" -type l -delete
+    fi
+
+    find "${final}" -name '.git' -prune -exec rm -rf {} + 2>/dev/null || true
+
+    size_mb="$(du -sm "${final}" | awk '{print $1}')"
+    (( size_mb < 200 )) || die "Сайт слишком большой: ${size_mb} МБ."
+
+    [[ -f "${final}/index.html" ]] || die "В готовом сайте нет index.html."
+
+    find "${final}" -type d -exec chmod 755 {} +
+    find "${final}" -type f -exec chmod 644 {} +
+    log "Сайт подготовлен: $(find "${final}" -type f | wc -l) файлов, ${size_mb} МБ."
+}
+
+# Переносит сайт в SITE_ROOT. Старый каталог сохраняется.
+install_final_site() {
+    local final="${WORK_DIR}/final" old=""
+
+    if [[ -e "${SITE_ROOT}" || -L "${SITE_ROOT}" ]]; then
+        old="${SITE_ROOT}.old.${BACKUP_SUFFIX}"
+        mv "${SITE_ROOT}" "${old}"
+        log "Прежний ${SITE_ROOT} сохранён в ${old}."
+    fi
+
+    mkdir -p "${SITE_ROOT}"
+    cp -a "${final}/." "${SITE_ROOT}/"
+    mkdir -p "${SITE_ROOT}/.well-known/acme-challenge"
     find "${SITE_ROOT}" -type d -exec chmod 755 {} +
     find "${SITE_ROOT}" -type f -exec chmod 644 {} +
+
+    [[ -f "${SITE_ROOT}/index.html" ]] || die "После установки в ${SITE_ROOT} нет index.html."
     log "Сайт установлен в ${SITE_ROOT}."
+}
+
+install_site() {
+    [[ -n "${SITE_FILE}" && -s "${SITE_FILE}" ]] || die "Сайт не передан."
+
+    WORK_DIR="$(mktemp -d /tmp/remnanode-work.XXXXXX)"
+    chmod 700 "${WORK_DIR}"
+
+    local norm="${WORK_DIR}/site.input"
+    normalize_site_input "${SITE_FILE}" "${norm}"
+
+    local kind=""
+    kind="$(detect_site_kind "${norm}")"
+
+    case "${kind}" in
+        html)
+            log "Обнаружена HTML-страница."
+            mkdir -p "${WORK_DIR}/html-src"
+            cp "${norm}" "${WORK_DIR}/html-src/index.html"
+            SITE_SOURCE_DIR="${WORK_DIR}/html-src"
+            ;;
+        bash)
+            log "Обнаружен bash-генератор сайта."
+            run_site_generator "${norm}"
+            ;;
+        unsupported-shebang)
+            die "Первая строка задаёт не bash и не sh. Поддерживаются HTML и bash-генератор (#!/bin/bash)."
+            ;;
+        *)
+            die "Не удалось распознать сайт. Нужен HTML (с <!DOCTYPE html> или <html>) или bash-генератор с первой строкой #!/bin/bash."
+            ;;
+    esac
+
+    prepare_final_site "${SITE_SOURCE_DIR}"
+    install_final_site
 }
 
 verify_site() {
@@ -993,6 +1305,7 @@ verify_site() {
 configure_selfsteal() {
     log "Настройка self-steal..."
     install_nginx
+    remove_foreign_nginx_configs
     write_nginx_config http
     nginx -t >/dev/null 2>&1 || die "Конфигурация nginx не прошла проверку."
     systemctl restart nginx
@@ -1073,7 +1386,7 @@ cascade_show_eu_instructions() {
    - SECRET_KEY EU-ноды из панели Remnawave;
    - домен: ${EU_SITE_DOMAIN};
    - название инбаунда: ${EU_INBOUND_NAME};
-   - сайт-заглушка (вставьте HTML или Bash-генератор, затем Ctrl+D).
+   - сайт-заглушка (HTML или bash-генератор, затем Ctrl+D).
 6. В конце установщик на EU выведет PublicKey, Short ID и PROFILE EU.
    PROFILE EU выводится только на EU-сервере, RU его не знает.
    Запишите PublicKey и Short ID, они понадобятся на RU.
@@ -1352,6 +1665,7 @@ show_result() {
     if (( SELFSTEAL == 1 )); then
         log "Домен self-steal: ${SITE_DOMAIN}"
         log "nginx: ${NGINX_VERSION:-уже был установлен}"
+        log "Сайт: ${SITE_ROOT}"
     fi
     if (( CASCADE == 1 )); then
         log "EU: ${EU_SITE_DOMAIN}"
