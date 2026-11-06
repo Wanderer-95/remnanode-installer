@@ -5,7 +5,7 @@
 #
 set -Eeuo pipefail
 
-INSTALLER_VERSION="1.8.0"
+INSTALLER_VERSION="1.9.0"
 INSTALLER_URL="https://raw.githubusercontent.com/Wanderer-95/remnanode-installer/main/install.sh"
 
 export DEBIAN_FRONTEND=noninteractive
@@ -24,8 +24,8 @@ DOCKER_DAEMON_JSON="/etc/docker/daemon.json"
 JOURNALD_DROPIN="/etc/systemd/journald.conf.d/99-remnanode.conf"
 
 NGINX_CONF="/etc/nginx/conf.d/remnanode-selfsteal.conf"
-NGINX_BACKUP_BASE="/root/remnanode-nginx-backup"
-SITE_ROOT="/var/www/html"
+NGINX_PREBACKUP="${NGINX_CONF}.pre-remnanode"
+SITE_ROOT="/var/www/remnanode-selfsteal"
 GENERATOR_TIMEOUT=900
 
 # Состояние каскада пишется на RU, пока ждём данные с EU.
@@ -315,7 +315,9 @@ read_secret_key() {
 ask_selfsteal_domain() {
     ask_valid SITE_DOMAIN "Домен этой ноды (self-steal, A-запись на этот сервер): " "${DOMAIN_RE}" "Некорректный домен."
     SITE_DOMAIN="${SITE_DOMAIN,,}"
+    SITE_ROOT="/var/www/remnanode-selfsteal/${SITE_DOMAIN}"
     log "Домен: ${SITE_DOMAIN}"
+    log "Каталог сайта: ${SITE_ROOT}"
 }
 
 collect_site() {
@@ -408,15 +410,42 @@ remove_remnanode() {
     fi
 
     if [[ -d "${INSTALL_DIR}" ]]; then
-        rm -rf "${INSTALL_DIR}"
+        rm -rf -- "${INSTALL_DIR}"
         log "Удалён каталог ${INSTALL_DIR}."
     fi
 
-    # Файлы с приватными ключами и старый профиль из версий до 1.9.0.
-    rm -f "${NGINX_CONF}" "${CASCADE_STATE_FILE}" "${LEGACY_PROFILE_FILE}"
-
+    # Удаляем только конфигурацию, принадлежащую этому установщику.
+    if [[ -f "${NGINX_PREBACKUP}" ]]; then
+        cp -a "${NGINX_PREBACKUP}" "${NGINX_CONF}"
+        rm -f -- "${NGINX_PREBACKUP}"
+    else
+        rm -f -- "${NGINX_CONF}"
+    fi
+    rm -f -- "${CASCADE_STATE_FILE}" "${LEGACY_PROFILE_FILE}"
+    local hook="/etc/letsencrypt/renewal-hooks/deploy/remnanode-selfsteal-reload-nginx.sh"
+    local hook_backup=""
+    hook_backup="$(find "$(dirname "${hook}")" -maxdepth 1 -type f -name "$(basename "${hook}").bak.*" -printf '%T@ %p\n' 2>/dev/null | sort -nr | awk 'NR==1 {$1=""; sub(/^ /,""); print}')"
+    if [[ -n "${hook_backup}" && -f "${hook_backup}" ]]; then
+        cp -a "${hook_backup}" "${hook}"
+    else
+        rm -f -- "${hook}"
+    fi
     if systemctl is-active --quiet nginx; then
-        systemctl reload nginx || warn "Не удалось перезагрузить nginx."
+        nginx -t >/dev/null 2>&1 && systemctl reload nginx ||
+            warn "Nginx не перезагружен: проверьте конфигурацию вручную."
+    fi
+
+    # Удаляем тег образа только если ни один контейнер (включая остановленные)
+    # больше не использует этот образ.
+    if command -v docker >/dev/null 2>&1 && docker image inspect "${IMAGE}" >/dev/null 2>&1; then
+        local users=""
+        users="$(docker ps -a --filter "ancestor=${IMAGE}" --format '{{.Names}}' 2>/dev/null || true)"
+        if [[ -z "${users}" ]]; then
+            docker image rm "${IMAGE}" >/dev/null 2>&1 ||
+                warn "Образ ${IMAGE} не удалён (возможно, используется другим тегом/контейнером)."
+        else
+            log "Образ ${IMAGE} сохранён: его используют контейнеры ${users//$'\n'/, }."
+        fi
     fi
 }
 
@@ -454,7 +483,7 @@ install_packages() {
     wait_for_apt
     apt-get install -y -qq \
         ca-certificates curl gnupg openssl python3 \
-        iproute2 iptables kmod ufw psmisc
+        iproute2 iptables kmod ufw psmisc util-linux
     log "Необходимые пакеты установлены."
 }
 
@@ -470,7 +499,16 @@ install_docker() {
 
     systemctl enable --now docker >/dev/null 2>&1
     docker info >/dev/null 2>&1 || die "Docker не запустился."
-    docker compose version >/dev/null 2>&1 || die "Docker Compose не найден."
+    if ! docker compose version >/dev/null 2>&1; then
+        warn "Docker Compose plugin не найден. Пробуем установить docker-compose-plugin."
+        wait_for_apt
+        apt-get update -qq
+        if ! apt-get install -y -qq docker-compose-plugin; then
+            apt-get install -y -qq docker-compose-v2 ||
+                die "Не удалось установить Docker Compose plugin (docker-compose-plugin / docker-compose-v2)."
+        fi
+    fi
+    docker compose version >/dev/null 2>&1 || die "Docker Compose не найден после установки."
     log "Docker и Docker Compose доступны."
 }
 
@@ -708,7 +746,18 @@ verify_docker_logging() {
     local driver
     driver="$(docker info --format '{{.LoggingDriver}}')"
     [[ "${driver}" == "json-file" ]] || die "Docker logging driver не применился: ${driver}"
-    log "Docker logging: ${driver}."
+
+    # Docker Info не во всех версиях показывает log-opts, поэтому сверяем daemon.json.
+    python3 - "${DOCKER_DAEMON_JSON}" <<'PY'
+import json,sys
+with open(sys.argv[1],encoding="utf-8") as f:
+    cfg=json.load(f)
+assert cfg.get("log-driver") == "json-file", "log-driver != json-file"
+opts=cfg.get("log-opts",{})
+assert opts.get("max-size") == "50m", "max-size != 50m"
+assert opts.get("max-file") == "3", "max-file != 3"
+PY
+    log "Docker logging: ${driver}, max-size=50m, max-file=3."
 }
 
 # ============================================================
@@ -871,17 +920,12 @@ show_plain_parameters() {
 install_nginx() {
     log "Установка nginx..."
 
-    # Остатки неудачной установки из nginx.org (без подписи) мешают apt update.
-    rm -f /etc/apt/sources.list.d/nginx.list \
-          /etc/apt/preferences.d/99-nginx-org \
-          /usr/share/keyrings/nginx-archive-keyring.gpg
-
+    # Не удаляем сторонние APT-репозитории, ключи и конфигурацию nginx.
     wait_for_apt
     apt-get update -qq
     wait_for_apt
     apt-get install -y -qq nginx certbot >/dev/null
 
-    rm -f /etc/nginx/sites-enabled/default
     systemctl enable nginx >/dev/null 2>&1 || true
 
     NGINX_VERSION="$(nginx -v 2>&1 | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -n1 || true)"
@@ -889,55 +933,61 @@ install_nginx() {
     log "nginx ${NGINX_VERSION} установлен."
 }
 
-# Удаляет чужие конфиги nginx, которые описывают тот же домен.
-# Остались, например, от генератора сайта в прошлом запуске и дают conflicting server name.
-# Копии сохраняются в каталог резервных копий.
-remove_foreign_nginx_configs() {
-    local dir f backup="${NGINX_BACKUP_BASE}.${BACKUP_SUFFIX}"
+# Не меняем чужие конфиги: при конфликте останавливаем установку и сообщаем точный файл.
+check_nginx_domain_conflicts() {
+    local f dir
+    local -a dirs=(/etc/nginx/conf.d /etc/nginx/sites-enabled)
 
-    for dir in /etc/nginx/conf.d /etc/nginx/sites-enabled; do
+    for dir in "${dirs[@]}"; do
         [[ -d "${dir}" ]] || continue
-        while IFS= read -r f; do
-            [[ -n "${f}" ]] || continue
+        while IFS= read -r -d '' f; do
             [[ "${f}" == "${NGINX_CONF}" ]] && continue
-            if grep -qF "${SITE_DOMAIN}" "${f}" 2>/dev/null; then
-                mkdir -p "${backup}"
-                mv "${f}" "${backup}/"
-                warn "Удалён конфликтующий конфиг nginx: ${f} (копия: ${backup}/)"
+            if grep -qF -- "${SITE_DOMAIN}" "${f}" 2>/dev/null; then
+                warn "Найден конфиг Nginx с доменом ${SITE_DOMAIN}: ${f}"
+                die "Конфликт домена. Чужой конфиг не изменён. Устраните конфликт вручную или выберите другой домен."
             fi
-        done < <(find "${dir}" -mindepth 1 -maxdepth 1 \( -type f -o -type l \) | sort)
+        done < <(find "${dir}" -maxdepth 1 \( -type f -o -type l \) -print0 2>/dev/null)
     done
-
-    if [[ -e /etc/nginx/sites-enabled/default || -L /etc/nginx/sites-enabled/default ]]; then
-        mkdir -p "${backup}"
-        mv /etc/nginx/sites-enabled/default "${backup}/"
-        warn "Отключён default-сайт nginx (копия: ${backup}/)."
-    fi
 }
 
 write_nginx_config() {
     local stage="$1"
+    local tmp="${NGINX_CONF}.new.$$"
     mkdir -p /etc/nginx/conf.d
 
     if [[ "${stage}" == "http" ]]; then
-        cat > "${NGINX_CONF}" <<'NGINX'
+        cat > "${tmp}" <<'NGINX'
 server {
     listen 80;
     listen [::]:80;
     server_name __DOMAIN__;
-    root /var/www/html;
-    location /.well-known/acme-challenge/ { allow all; }
-    location / { return 200 'ok'; add_header Content-Type text/plain; }
+    root __SITE_ROOT__;
+    index index.html;
+
+    location ^~ /.well-known/acme-challenge/ {
+        try_files $uri =404;
+    }
+
+    location / {
+        try_files $uri $uri/ =404;
+    }
 }
 NGINX
     else
-        cat > "${NGINX_CONF}" <<'NGINX'
+        cat > "${tmp}" <<'NGINX'
 server {
     listen 80;
     listen [::]:80;
     server_name __DOMAIN__;
-    location /.well-known/acme-challenge/ { root /var/www/html; allow all; }
-    location / { return 301 https://$host$request_uri; }
+    root __SITE_ROOT__;
+
+    location ^~ /.well-known/acme-challenge/ {
+        try_files $uri =404;
+    }
+
+    location / {
+        return 301 https://$host$request_uri;
+    }
 }
 
 server {
@@ -950,23 +1000,48 @@ server {
     ssl_session_cache shared:SSL:10m;
     ssl_session_timeout 1d;
 
-    root /var/www/html;
+    root __SITE_ROOT__;
     index index.html;
-    add_header X-Content-Type-Options nosniff;
+    add_header X-Content-Type-Options nosniff always;
 
-    location / { try_files $uri $uri/ =404; }
+    location / {
+        try_files $uri $uri/ =404;
+    }
 }
 NGINX
     fi
 
-    sed -i "s|__DOMAIN__|${SITE_DOMAIN}|g" "${NGINX_CONF}"
-    log "Конфиг nginx записан: ${NGINX_CONF}"
+    sed -i \
+        -e "s|__DOMAIN__|${SITE_DOMAIN}|g" \
+        -e "s|__SITE_ROOT__|${SITE_ROOT}|g" \
+        "${tmp}"
+    chmod 644 "${tmp}"
+
+    if [[ -f "${NGINX_CONF}" ]]; then
+        cp -a "${NGINX_CONF}" "${NGINX_CONF}.bak.${BACKUP_SUFFIX}"
+        if [[ ! -e "${NGINX_PREBACKUP}" ]]; then
+            cp -a "${NGINX_CONF}" "${NGINX_PREBACKUP}"
+            chmod 600 "${NGINX_PREBACKUP}"
+        fi
+    fi
+    mv -f "${tmp}" "${NGINX_CONF}"
+
+    if ! nginx -t >/dev/null 2>&1; then
+        if [[ -f "${NGINX_CONF}.bak.${BACKUP_SUFFIX}" ]]; then
+            cp -a "${NGINX_CONF}.bak.${BACKUP_SUFFIX}" "${NGINX_CONF}"
+        else
+            rm -f "${NGINX_CONF}"
+        fi
+        nginx -t || true
+        die "Конфигурация nginx не прошла проверку. Предыдущий конфиг восстановлен."
+    fi
+    log "Конфиг nginx записан и проверен: ${NGINX_CONF}"
 }
 
 issue_certificate() {
     log "Получение сертификата Let's Encrypt для ${SITE_DOMAIN}..."
 
-    mkdir -p "${SITE_ROOT}"
+    mkdir -p "${SITE_ROOT}/.well-known/acme-challenge"
     certbot certonly \
         --webroot -w "${SITE_ROOT}" \
         -d "${SITE_DOMAIN}" \
@@ -980,10 +1055,12 @@ issue_certificate() {
         die "Сертификат не найден после выпуска."
 
     mkdir -p /etc/letsencrypt/renewal-hooks/deploy
-    printf '#!/bin/sh\nsystemctl reload nginx\n' > /etc/letsencrypt/renewal-hooks/deploy/reload-nginx.sh
-    chmod 755 /etc/letsencrypt/renewal-hooks/deploy/reload-nginx.sh
+    local hook="/etc/letsencrypt/renewal-hooks/deploy/remnanode-selfsteal-reload-nginx.sh"
+    backup_file "${hook}"
+    printf '#!/bin/sh\nsystemctl reload nginx\n' > "${hook}"
+    chmod 755 "${hook}"
 
-    if ! certbot renew --dry-run >/dev/null 2>&1; then
+    if ! certbot renew --cert-name "${SITE_DOMAIN}" --dry-run >/dev/null 2>&1; then
         warn "Проверка автообновления не прошла. Проверьте порт 80 снаружи:"
         warn "  curl -I http://${SITE_DOMAIN}   (с другой машины)"
     fi
@@ -1037,19 +1114,14 @@ detect_site_kind() {
 }
 
 # Список всех index.html с отметкой времени и размером, отсортированный для comm.
-index_snapshot() {
-    local out="$1"
-    LC_ALL=C find /var/www /srv /opt /root /home /tmp /var/tmp \
-        -maxdepth 5 -path "${INSTALL_DIR}" -prune -o \
-        -type f -name index.html -printf '%p|%T@|%s\n' 2>/dev/null |
-        LC_ALL=C sort > "${out}" || true
-}
+
 
 # Полный снимок /etc/nginx до запуска генератора.
 snapshot_nginx() {
     NGINX_SNAPSHOT="${WORK_DIR}/nginx-snapshot"
     rm -rf "${NGINX_SNAPSHOT}"
     cp -a /etc/nginx "${NGINX_SNAPSHOT}"
+    chmod 700 "${NGINX_SNAPSHOT}"
 }
 
 # Если генератор изменил nginx, возвращаем снимок целиком и проверяем конфиг.
@@ -1105,55 +1177,18 @@ check_node_running() {
 
 # Выбирает каталог, где лежит готовый сайт. Результат пишется в SITE_SOURCE_DIR.
 pick_site_source() {
-    local gen_dir="$1" changed="$2"
-    local -a cands=()
-    local c best="" html
-
-    while IFS= read -r c; do
-        if [[ -n "${c}" ]]; then
-            cands+=("${c}")
-        fi
-    done <<< "${changed}"
+    local gen_dir="$1"
+    local html=""
 
     if [[ -f "${gen_dir}/index.html" ]]; then
         SITE_SOURCE_DIR="${gen_dir}"
         return 0
     fi
 
-    for c in "${cands[@]}"; do
-        if [[ "${c}" == *"${SITE_DOMAIN}"* ]]; then
-            best="${c}"
-            break
-        fi
-    done
-
-    if [[ -z "${best}" ]]; then
-        for c in "${cands[@]}"; do
-            if [[ "${c}" == "${SITE_ROOT}/index.html" ]]; then
-                best="${c}"
-                break
-            fi
-        done
-    fi
-
-    if [[ -z "${best}" && ${#cands[@]} -gt 0 ]]; then
-        best="${cands[0]}"
-    fi
-
-    if (( ${#cands[@]} > 1 )); then
-        warn "Генератор создал несколько index.html. Используется: ${best}"
-    fi
-
-    if [[ -n "${best}" ]]; then
-        SITE_SOURCE_DIR="$(dirname "${best}")"
-        return 0
-    fi
-
-    # Index.html не найден, но есть другая HTML-страница: переименовываем её.
-    html="$(find "${gen_dir}" -maxdepth 3 -type f -name '*.html' 2>/dev/null | sort | head -n1 || true)"
+    html="$(find "${gen_dir}" -maxdepth 4 -type f -name '*.html' -print 2>/dev/null | sort | head -n1 || true)"
     if [[ -n "${html}" ]]; then
         cp "${html}" "${gen_dir}/index.html"
-        warn "Генератор не создал index.html. Страница ${html} использована как index.html."
+        warn "Генератор не создал index.html. Первая HTML-страница использована как index.html."
         SITE_SOURCE_DIR="${gen_dir}"
         return 0
     fi
@@ -1165,22 +1200,33 @@ run_site_generator() {
     local script="$1"
     local gen_dir="${WORK_DIR}/gen-out"
     local gen_log="${WORK_DIR}/generator.log"
-    local rc=0 changed=""
+    local rc=0
 
     mkdir -p "${gen_dir}"
-    cp "${script}" "${WORK_DIR}/generator.sh"
-    chmod 600 "${WORK_DIR}/generator.sh"
+    chmod 711 "${WORK_DIR}"
+    chown nobody:nogroup "${gen_dir}"
+    chmod 755 "${gen_dir}"
+    cp "${script}" "${gen_dir}/generator.sh"
+    chown nobody:nogroup "${gen_dir}/generator.sh"
+    chmod 644 "${gen_dir}/generator.sh"
+    if ! bash -n "${gen_dir}/generator.sh" 2>"${WORK_DIR}/generator-syntax.log"; then
+        cat "${WORK_DIR}/generator-syntax.log" >&2
+        die "В bash-генераторе обнаружена синтаксическая ошибка."
+    fi
 
-    index_snapshot "${WORK_DIR}/index.before"
     snapshot_nginx
 
-    log "Запуск генератора сайта (до ${GENERATOR_TIMEOUT} секунд, ввод с клавиатуры отключён)..."
+    command -v runuser >/dev/null 2>&1 || die "Не найден runuser (пакет util-linux)."
+    id nobody >/dev/null 2>&1 || die "В системе отсутствует пользователь nobody."
+    log "Запуск генератора от nobody (до ${GENERATOR_TIMEOUT} секунд, ввод отключён)..."
 
     (
         cd "${gen_dir}"
-        export SITE_DOMAIN
-        export OUT_DIR="${gen_dir}" SITE_OUT="${gen_dir}" WEB_ROOT="${gen_dir}" SITE_ROOT="${gen_dir}"
-        timeout --kill-after=20 "${GENERATOR_TIMEOUT}" bash "${WORK_DIR}/generator.sh" "${gen_dir}" </dev/null
+        runuser -u nobody -- env \
+            HOME=/tmp USER=nobody LOGNAME=nobody \
+            SITE_DOMAIN="${SITE_DOMAIN}" \
+            OUT_DIR="${gen_dir}" SITE_OUT="${gen_dir}" WEB_ROOT="${gen_dir}" SITE_ROOT="${gen_dir}" \
+            timeout --kill-after=20 "${GENERATOR_TIMEOUT}" bash "${gen_dir}/generator.sh" "${gen_dir}" </dev/null
     ) > "${gen_log}" 2>&1 || rc=$?
 
     if (( rc != 0 )); then
@@ -1197,10 +1243,7 @@ run_site_generator() {
     check_ports_after_generator
     check_node_running
 
-    index_snapshot "${WORK_DIR}/index.after"
-    changed="$(LC_ALL=C comm -13 "${WORK_DIR}/index.before" "${WORK_DIR}/index.after" | cut -d'|' -f1 || true)"
-
-    if ! pick_site_source "${gen_dir}" "${changed}"; then
+    if ! pick_site_source "${gen_dir}"; then
         keep_generator_log "${gen_log}"
         die "Генератор не создал ни одной HTML-страницы. Проверьте логику генератора и лог."
     fi
@@ -1230,6 +1273,8 @@ prepare_final_site() {
 
     [[ -f "${final}/index.html" ]] || die "В готовом сайте нет index.html."
 
+    find "${final}" ! -type d ! -type f -delete
+    chown -R root:root "${final}"
     find "${final}" -type d -exec chmod 755 {} +
     find "${final}" -type f -exec chmod 644 {} +
     log "Сайт подготовлен: $(find "${final}" -type f | wc -l) файлов, ${size_mb} МБ."
@@ -1248,6 +1293,7 @@ install_final_site() {
     mkdir -p "${SITE_ROOT}"
     cp -a "${final}/." "${SITE_ROOT}/"
     mkdir -p "${SITE_ROOT}/.well-known/acme-challenge"
+    chown -R root:root "${SITE_ROOT}"
     find "${SITE_ROOT}" -type d -exec chmod 755 {} +
     find "${SITE_ROOT}" -type f -exec chmod 644 {} +
 
@@ -1302,19 +1348,36 @@ verify_site() {
     log "Сайт-заглушка отвечает на ${SITE_DOMAIN}."
 }
 
+restart_nginx_checked() {
+    if systemctl restart nginx; then
+        systemctl is-active --quiet nginx || die "Nginx не перешёл в active."
+        return 0
+    fi
+
+    warn "Nginx не запустился после изменения конфигурации. Откатываем последний конфиг."
+    if [[ -f "${NGINX_CONF}.bak.${BACKUP_SUFFIX}" ]]; then
+        cp -a "${NGINX_CONF}.bak.${BACKUP_SUFFIX}" "${NGINX_CONF}"
+    else
+        rm -f "${NGINX_CONF}"
+    fi
+    nginx -t || die "После отката конфигурация Nginx также не проходит проверку."
+    systemctl restart nginx || die "Не удалось восстановить предыдущий Nginx."
+    die "Новая конфигурация Nginx не применена; предыдущая восстановлена."
+}
+
 configure_selfsteal() {
     log "Настройка self-steal..."
     install_nginx
-    remove_foreign_nginx_configs
+    check_nginx_domain_conflicts
     write_nginx_config http
     nginx -t >/dev/null 2>&1 || die "Конфигурация nginx не прошла проверку."
-    systemctl restart nginx
+    restart_nginx_checked
 
     issue_certificate
 
     write_nginx_config ssl
     nginx -t >/dev/null 2>&1 || die "Финальный конфиг nginx не прошёл проверку."
-    systemctl restart nginx
+    restart_nginx_checked
 
     install_site
     verify_site
