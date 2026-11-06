@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
 #
 # Remnawave Node installer
-# Режимы: 1) без self-steal  2) с self-steal  3) каскад RU -> EU  4) переустановка
+# Режимы: 1) без self-steal  2) с self-steal  3) каскад RU -> EU  4) переустановка  5) продолжить каскад
 #
 set -Eeuo pipefail
 
-INSTALLER_VERSION="1.6.0"
+INSTALLER_VERSION="1.7.0"
 INSTALLER_URL="https://raw.githubusercontent.com/Wanderer-95/remnanode-installer/main/install.sh"
 
 export DEBIAN_FRONTEND=noninteractive
@@ -26,12 +26,19 @@ JOURNALD_DROPIN="/etc/systemd/journald.conf.d/99-remnanode.conf"
 NGINX_CONF="/etc/nginx/conf.d/remnanode-selfsteal.conf"
 SITE_ROOT="/var/www/html"
 
+# Состояние каскада пишется на RU, пока ждём данные с EU.
+# Содержит приватный ключ RU, права 600. Удаляется после подтверждения Enter.
+CASCADE_STATE_FILE="/root/remnanode-cascade.state"
+# Файл профиля из версий до 1.9.0. Больше не создаётся, удаляется при переустановке.
+LEGACY_PROFILE_FILE="/root/remnanode-profile.json"
+
 BACKUP_SUFFIX="$(date +%Y%m%d-%H%M%S)"
 
 DOMAIN_RE='^([A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?\.)+[A-Za-z]{2,63}$'
 UUID_RE='^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$'
 PUBKEY_RE='^[A-Za-z0-9_-]{43}$'
 SHORTID_RE='^[0-9a-f]{2,16}$'
+NAME_RE='^[A-Za-z0-9_-]{1,32}$'
 
 # ============================================================
 # STATE
@@ -39,6 +46,7 @@ SHORTID_RE='^[0-9a-f]{2,16}$'
 
 MENU_ACTION=""
 REINSTALL=0
+RESUME=0
 REINSTALL_TYPE=""
 CONFIRM_DELETE=""
 SELFSTEAL=0
@@ -47,7 +55,6 @@ CASCADE=0
 MAIN_INTERFACE=""
 EXISTING_SECRET_KEY=""
 SECRET_KEY=""
-RESTART_CONFIRM=""
 INBOUND_NAME=""
 SITE_DOMAIN=""
 SITE_FILE=""
@@ -86,6 +93,7 @@ cleanup() {
     if [[ -n "${PASTE_TMP}" && -f "${PASTE_TMP}" ]]; then
         rm -f "${PASTE_TMP}"
     fi
+    PROFILE_JSON=""
     return 0
 }
 trap cleanup EXIT
@@ -128,7 +136,7 @@ ask_valid() {
     done
 }
 
-# ask_secret_confirmed VAR "подсказка" — секрет вводится дважды
+# ask_secret_confirmed VAR "подсказка": секрет вводится дважды
 ask_secret_confirmed() {
     local var="$1" prompt="$2" again=""
 
@@ -150,8 +158,7 @@ ask_secret_confirmed() {
 
 check_system() {
     [[ "${EUID}" -eq 0 ]] || die "Запустите установщик от root."
-
-    [[ -t 0 ]] || die "Нужен интерактивный терминал."
+    [[ -t 0 ]] || die "Нужен интерактивный терминал. Запускайте так: bash <(curl -fsSL ${INSTALLER_URL})"
 
     [[ -f /etc/os-release ]] || die "Не удалось определить ОС."
     # shellcheck disable=SC1091
@@ -192,7 +199,7 @@ select_reinstall() {
     ask REINSTALL_TYPE "Выберите тип [1/2/3]: "
     apply_type "${REINSTALL_TYPE}"
 
-    warn "Будет удалён текущий Remnawave Node."
+    warn "Будет удалён текущий Remnawave Node и незавершённый каскад (если был)."
     warn "Docker, SSH, UFW и остальные контейнеры сохраняются."
     ask CONFIRM_DELETE "Для подтверждения введите DELETE: "
     [[ "${CONFIRM_DELETE}" == "DELETE" ]] || die "Операция отменена."
@@ -209,6 +216,9 @@ select_mode() {
     echo "2) Установка с self-steal"
     echo "3) Каскад RU -> EU (с self-steal)"
     echo "4) Удалить Remnawave Node и установить заново"
+    if [[ -f "${CASCADE_STATE_FILE}" ]]; then
+        echo "5) Продолжить каскад RU -> EU (ввести PublicKey и Short ID с EU)"
+    fi
     echo "0) Выход"
     echo
 
@@ -221,6 +231,10 @@ select_mode() {
             ;;
         4)
             select_reinstall
+            ;;
+        5)
+            [[ -f "${CASCADE_STATE_FILE}" ]] || die "Нет сохранённого состояния каскада."
+            RESUME=1
             ;;
         0)
             exit 0
@@ -257,7 +271,8 @@ PY
 }
 
 docker_container_exists() {
-    docker container inspect "${CONTAINER_NAME}" >/dev/null 2>&1
+    command -v docker >/dev/null 2>&1 &&
+        docker container inspect "${CONTAINER_NAME}" >/dev/null 2>&1
 }
 
 backup_file() {
@@ -268,7 +283,7 @@ backup_file() {
 }
 
 # ============================================================
-# COLLECT ALL ANSWERS BEFORE CHANGING THE SERVER
+# COLLECT ANSWERS BEFORE CHANGING THE SERVER
 # ============================================================
 
 read_secret_key() {
@@ -276,7 +291,7 @@ read_secret_key() {
         echo
         info "Найден SECRET_KEY от предыдущей установки."
         local choice=""
-        ask choice "1) оставить существующий, 2) ввести новый: "
+        ask_valid choice "1) оставить существующий, 2) ввести новый: " '^[12]$' "Введите 1 или 2."
         if [[ "${choice}" == "1" ]]; then
             SECRET_KEY="${EXISTING_SECRET_KEY}"
             log "Используется существующий SECRET_KEY."
@@ -323,21 +338,33 @@ ask_restart_if_needed() {
     if [[ "${count}" =~ ^[0-9]+$ ]] && (( count > 0 )); then
         warn "На сервере есть другие запущенные контейнеры (${count})."
         warn "Перезапуск Docker временно прервёт их работу. Контейнеры с restart policy поднимутся сами."
-        ask_valid RESTART_CONFIRM "Для перезапуска Docker введите RESTART: " '^RESTART$' "Введите RESTART."
-    else
-        RESTART_CONFIRM="RESTART"
+        local restart_confirm=""
+        ask_valid restart_confirm "Для перезапуска Docker введите RESTART: " '^RESTART$' "Введите RESTART."
     fi
+}
+
+ask_inbound_name() {
+    local var="$1" prompt="$2"
+    ask_valid "${var}" "${prompt}" "${NAME_RE}" "Допустимы латинские буквы, цифры, _ и - (до 32 символов)."
 }
 
 ask_cascade_params() {
     echo
-    info "Параметры EU-ноды. Скрипт не заходит на EU сам: эти данные нужны для профиля RU"
-    info "и для инструкции, которую вы выполните на EU вручную."
+    info "Параметры EU-ноды. Скрипт не заходит на EU сам."
+    info "Эти данные нужны для профиля RU и для инструкции, которую вы выполните на EU."
 
-    ask_valid EU_SITE_DOMAIN "Домен EU-ноды (A-запись на EU): " "${DOMAIN_RE}" "Некорректный домен."
-    EU_SITE_DOMAIN="${EU_SITE_DOMAIN,,}"
+    while true; do
+        ask_valid EU_SITE_DOMAIN "Домен EU-ноды (A-запись на EU): " "${DOMAIN_RE}" "Некорректный домен."
+        EU_SITE_DOMAIN="${EU_SITE_DOMAIN,,}"
+        if [[ "${EU_SITE_DOMAIN}" != "${SITE_DOMAIN}" ]]; then
+            break
+        fi
+        warn "Домен EU должен отличаться от домена RU."
+    done
+
     ask_valid EU_UUID "UUID пользователя для RU на EU (flow xtls-rprx-vision): " "${UUID_RE}" "Некорректный UUID."
-    ask EU_INBOUND_NAME "Название инбаунда на EU (например, DE_IN): "
+    EU_UUID="${EU_UUID,,}"
+    ask_inbound_name EU_INBOUND_NAME "Название инбаунда на EU (например, DE_IN): "
 }
 
 collect_answers() {
@@ -345,7 +372,7 @@ collect_answers() {
 
     if (( SELFSTEAL == 1 )); then
         ask_selfsteal_domain
-        ask INBOUND_NAME "Название инбаунда этой ноды (например, RU_IN): "
+        ask_inbound_name INBOUND_NAME "Название инбаунда этой ноды (например, RU_IN): "
         collect_site
     fi
 
@@ -374,7 +401,9 @@ remove_remnanode() {
         log "Удалён каталог ${INSTALL_DIR}."
     fi
 
-    rm -f "${NGINX_CONF}"
+    # Старые файлы с приватными ключами: состояние каскада и профиль из версий до 1.9.0.
+    rm -f "${NGINX_CONF}" "${CASCADE_STATE_FILE}" "${LEGACY_PROFILE_FILE}"
+
     if systemctl is-active --quiet nginx; then
         systemctl reload nginx || warn "Не удалось перезагрузить nginx."
     fi
@@ -574,53 +603,57 @@ EOF
     log "Лимиты Docker записаны."
 }
 
+# daemon.json сначала пишется во временный файл и проверяется.
+# Боевой файл заменяется только после успешной проверки, иначе Docker не поднимется.
 configure_docker_logging() {
     log "Настройка Docker logging..."
     mkdir -p /etc/docker
     backup_file "${DOCKER_DAEMON_JSON}"
 
-    python3 - "${DOCKER_DAEMON_JSON}" <<'PY'
+    local tmp
+    tmp="$(mktemp /etc/docker/daemon.json.new.XXXXXX)"
+    chmod 644 "${tmp}"
+
+    if ! python3 - "${DOCKER_DAEMON_JSON}" "${tmp}" <<'PY'
 import json
 import os
 import sys
-import tempfile
 
-path = sys.argv[1]
+src, dst = sys.argv[1], sys.argv[2]
 config = {}
 
-if os.path.exists(path):
-    with open(path, "r", encoding="utf-8") as f:
+if os.path.exists(src):
+    with open(src, "r", encoding="utf-8") as f:
         config = json.load(f)
 
 if not isinstance(config, dict):
     raise SystemExit("daemon.json должен содержать JSON-объект")
 
-config["log-driver"] = "json-file"
 log_opts = config.get("log-opts", {})
 if not isinstance(log_opts, dict):
     raise SystemExit("log-opts должен быть JSON-объектом")
+
+config["log-driver"] = "json-file"
 log_opts["max-size"] = "50m"
 log_opts["max-file"] = "3"
 config["log-opts"] = log_opts
 
-directory = os.path.dirname(path)
-fd, temp_path = tempfile.mkstemp(prefix="daemon.json.", dir=directory)
-try:
-    with os.fdopen(fd, "w", encoding="utf-8") as f:
-        json.dump(config, f, indent=2)
-        f.write("\n")
-    os.chmod(temp_path, 0o644)
-    os.replace(temp_path, path)
-except Exception:
-    if os.path.exists(temp_path):
-        os.unlink(temp_path)
-    raise
+with open(dst, "w", encoding="utf-8") as f:
+    json.dump(config, f, indent=2, ensure_ascii=False)
+    f.write("\n")
 PY
+    then
+        rm -f "${tmp}"
+        die "Не удалось собрать ${DOCKER_DAEMON_JSON}. Проверьте его содержимое вручную."
+    fi
 
-    python3 -m json.tool "${DOCKER_DAEMON_JSON}" >/dev/null
-    dockerd --validate --config-file="${DOCKER_DAEMON_JSON}" >/dev/null 2>&1 ||
-        die "Конфигурация Docker не прошла проверку."
-    log "Конфигурация Docker прошла проверку."
+    if ! dockerd --validate --config-file="${tmp}" >/dev/null 2>&1; then
+        rm -f "${tmp}"
+        die "Конфигурация Docker не прошла проверку. Файл ${DOCKER_DAEMON_JSON} не изменён."
+    fi
+
+    mv -f "${tmp}" "${DOCKER_DAEMON_JSON}"
+    log "Конфигурация Docker прошла проверку и применена."
 }
 
 configure_journald() {
@@ -671,27 +704,39 @@ verify_docker_logging() {
 # FIREWALL
 # ============================================================
 
-detect_ssh_port() {
-    local port=""
-    mkdir -p /run/sshd 2>/dev/null || true
-    port="$(
-        { sshd -T 2>/dev/null || true; } |
-        awk '$1=="port" {print $2; exit}'
+# Собирает все порты SSH, которые могут быть активны:
+# из текущей сессии, из конфига sshd, из реально слушающих процессов и из ssh.socket.
+# Все найденные порты открываются, чтобы не потерять доступ к серверу.
+detect_ssh_ports() {
+    local candidates
+    candidates="$(
+        {
+            awk '{print $4}' <<< "${SSH_CONNECTION:-}"
+            mkdir -p /run/sshd 2>/dev/null || true
+            sshd -T 2>/dev/null | awk '$1=="port" {print $2}' || true
+            ss -tlnp 2>/dev/null | awk '/sshd/ {n=split($4,a,":"); print a[n]}' || true
+            systemctl show ssh.socket -p Listen --value 2>/dev/null | grep -oE ':[0-9]+' | tr -d ':' || true
+        } |
+        grep -E '^[0-9]+$' |
+        awk '$1 >= 1 && $1 <= 65535' |
+        sort -un || true
     )"
-    if [[ ! "${port}" =~ ^[0-9]+$ ]]; then
-        # Порт текущего SSH-соединения: server_port — четвёртое поле SSH_CONNECTION.
-        port="$(awk '{print $4}' <<< "${SSH_CONNECTION:-}" 2>/dev/null || true)"
+
+    if [[ -z "${candidates}" ]]; then
+        candidates="22"
     fi
-    [[ "${port}" =~ ^[0-9]+$ ]] || port="22"
-    echo "${port}"
+    printf '%s\n' "${candidates}"
 }
 
 configure_firewall() {
     log "Настройка UFW..."
-    local ssh_port
-    ssh_port="$(detect_ssh_port)"
 
-    ufw allow "${ssh_port}/tcp" comment 'SSH' >/dev/null
+    local port ssh_ports=""
+    while read -r port; do
+        ufw allow "${port}/tcp" comment 'SSH' >/dev/null
+        ssh_ports+="${port} "
+    done < <(detect_ssh_ports)
+
     ufw allow 2222/tcp comment 'Remnawave Node API' >/dev/null
     ufw allow 443/tcp comment 'Reality' >/dev/null
 
@@ -705,7 +750,7 @@ configure_firewall() {
         ufw --force enable >/dev/null
     fi
 
-    log "UFW настроен. SSH-порт: ${ssh_port}."
+    log "UFW настроен. Открыты SSH-порты: ${ssh_ports% }."
 }
 
 # ============================================================
@@ -777,6 +822,7 @@ start_node() {
     die "Remnawave Node не запустился."
 }
 
+# Генерирует ключи Reality один раз для всех режимов.
 generate_keys() {
     log "Генерация ключей Reality (X25519)..."
 
@@ -788,13 +834,14 @@ generate_keys() {
     PUBLIC_KEY="$(awk -F': *' '/^(PublicKey|Password)/ {print $2; exit}' <<< "${out}" | tr -d '[:space:]')"
     SHORT_ID="$(openssl rand -hex 8)"
 
-    [[ -n "${PRIVATE_KEY}" && -n "${PUBLIC_KEY}" ]] || die "Не удалось разобрать вывод xray x25519."
+    [[ "${PRIVATE_KEY}" =~ ${PUBKEY_RE} && "${PUBLIC_KEY}" =~ ${PUBKEY_RE} ]] ||
+        die "Не удалось разобрать вывод xray x25519."
+    [[ "${SHORT_ID}" =~ ${SHORTID_RE} ]] || die "Не удалось сгенерировать Short ID."
     log "Ключи сгенерированы."
 }
 
-generate_parameters() {
-    # Режим без self-steal: только вывод параметров.
-    generate_keys
+# Режим без self-steal: показываем только параметры, профиль не нужен.
+show_plain_parameters() {
     echo
     echo "========================================"
     echo "          NODE PARAMETERS"
@@ -803,6 +850,7 @@ generate_parameters() {
     echo "PublicKey:  ${PUBLIC_KEY}"
     echo "Short ID:   ${SHORT_ID}"
     echo "========================================"
+    warn "PrivateKey секретный. Не публикуйте его."
 }
 
 # ============================================================
@@ -960,25 +1008,79 @@ configure_selfsteal() {
 }
 
 # ============================================================
-# CASCADE: MANUAL STEP ON EU
+# CASCADE: STATE, MANUAL STEP ON EU
 # ============================================================
+
+# Значения читаются построчно и проверяются регулярками. Файл не выполняется через source.
+state_get() {
+    sed -n "s/^$1=//p" "${CASCADE_STATE_FILE}" | head -n1
+}
+
+save_cascade_state() {
+    umask 077
+    cat > "${CASCADE_STATE_FILE}" <<EOF
+SITE_DOMAIN=${SITE_DOMAIN}
+INBOUND_NAME=${INBOUND_NAME}
+PRIVATE_KEY=${PRIVATE_KEY}
+PUBLIC_KEY=${PUBLIC_KEY}
+SHORT_ID=${SHORT_ID}
+EU_SITE_DOMAIN=${EU_SITE_DOMAIN}
+EU_INBOUND_NAME=${EU_INBOUND_NAME}
+EU_UUID=${EU_UUID}
+EOF
+    chmod 600 "${CASCADE_STATE_FILE}"
+    log "Состояние каскада сохранено (нужно для пункта 5 при прерывании)."
+}
+
+load_cascade_state() {
+    [[ -f "${CASCADE_STATE_FILE}" ]] || die "Файл состояния каскада не найден: ${CASCADE_STATE_FILE}"
+
+    SITE_DOMAIN="$(state_get SITE_DOMAIN)"
+    INBOUND_NAME="$(state_get INBOUND_NAME)"
+    PRIVATE_KEY="$(state_get PRIVATE_KEY)"
+    PUBLIC_KEY="$(state_get PUBLIC_KEY)"
+    SHORT_ID="$(state_get SHORT_ID)"
+    EU_SITE_DOMAIN="$(state_get EU_SITE_DOMAIN)"
+    EU_INBOUND_NAME="$(state_get EU_INBOUND_NAME)"
+    EU_UUID="$(state_get EU_UUID)"
+
+    if [[ "${SITE_DOMAIN}" =~ ${DOMAIN_RE} ]] &&
+       [[ "${INBOUND_NAME}" =~ ${NAME_RE} ]] &&
+       [[ "${PRIVATE_KEY}" =~ ${PUBKEY_RE} ]] &&
+       [[ "${PUBLIC_KEY}" =~ ${PUBKEY_RE} ]] &&
+       [[ "${SHORT_ID}" =~ ${SHORTID_RE} ]] &&
+       [[ "${EU_SITE_DOMAIN}" =~ ${DOMAIN_RE} ]] &&
+       [[ "${EU_INBOUND_NAME}" =~ ${NAME_RE} ]] &&
+       [[ "${EU_UUID}" =~ ${UUID_RE} ]]; then
+        :
+    else
+        die "Состояние каскада повреждено. Запустите пункт 4 (переустановка RU)."
+    fi
+
+    SELFSTEAL=1
+    CASCADE=1
+}
 
 cascade_show_eu_instructions() {
     local text
     text="$(cat <<EOF
-1. Зайдите по SSH на EU-сервер (${EU_SITE_DOMAIN}). Сервер должен быть чистым, Ubuntu 24.04.
-2. Выполните команду:
+1. Создайте ноду для EU в панели Remnawave и скопируйте её SECRET_KEY.
+2. Зайдите по SSH на EU-сервер (${EU_SITE_DOMAIN}). Сервер должен быть чистым, Ubuntu 24.04.
+3. Выполните команду:
    bash <(curl -fsSL ${INSTALLER_URL})
-3. Выберите пункт 2 (установка с self-steal).
-4. Введите данные по запросам:
+4. Выберите пункт 2 (установка с self-steal).
+5. Введите данные по запросам:
    - SECRET_KEY EU-ноды из панели Remnawave;
    - домен: ${EU_SITE_DOMAIN};
    - название инбаунда: ${EU_INBOUND_NAME};
    - сайт-заглушка (вставьте HTML или Bash-генератор, затем Ctrl+D).
-5. В конце установщик покажет PublicKey и Short ID. Скопируйте их, они понадобятся на RU.
-6. Из вывода установщика на EU возьмите PROFILE и вставьте его в конфиг-профиль панели Remnawave для EU-ноды.
-7. В этом же профиле или в панели добавьте пользователя с UUID ${EU_UUID} и flow xtls-rprx-vision.
-8. Вернитесь на RU-сервер. Скрипт будет ждать ввода PublicKey и Short ID с EU.
+6. В конце установщик на EU выведет PublicKey, Short ID и PROFILE EU.
+   PROFILE EU выводится только на EU-сервере, RU его не знает.
+   Запишите PublicKey и Short ID, они понадобятся на RU.
+7. Вставьте PROFILE EU в конфиг-профиль панели Remnawave для EU-ноды.
+8. Убедитесь, что на EU есть клиент с UUID ${EU_UUID} и flow xtls-rprx-vision.
+9. Вернитесь на RU-сервер. Скрипт будет ждать ввода PublicKey и Short ID с EU.
+   Если прервались, запустите установщик на RU и выберите пункт 5.
 EOF
 )"
     show_block "ДЕЙСТВИЕ НА EU-СЕРВЕРЕ" "${text}"
@@ -986,9 +1088,19 @@ EOF
 
 cascade_ask_eu_keys() {
     echo
-    info "Введите данные, которые EU-установщик вывел в конце."
-    ask_valid EU_PUBLIC_KEY "PublicKey с EU: " "${PUBKEY_RE}" "Некорректный PublicKey (43 символа)."
+    info "Введите PublicKey и Short ID, которые EU-установщик вывел в конце."
+
+    while true; do
+        ask_valid EU_PUBLIC_KEY "PublicKey с EU: " "${PUBKEY_RE}" "Некорректный PublicKey (43 символа, base64url)."
+        if [[ "${EU_PUBLIC_KEY}" != "${PUBLIC_KEY}" ]]; then
+            break
+        fi
+        warn "Этот PublicKey совпадает с ключом RU. Введите PublicKey именно с EU."
+        EU_PUBLIC_KEY=""
+    done
+
     ask_valid EU_SHORT_ID "Short ID с EU: " "${SHORTID_RE}" "Некорректный Short ID (hex, 2-16 символов)."
+    EU_SHORT_ID="${EU_SHORT_ID,,}"
     log "Данные EU приняты."
 }
 
@@ -1115,65 +1227,59 @@ show_block() {
     echo "========================================"
 }
 
-output_profiles() {
+# Выводит профиль RU в терминал. Файлов с профилем не создаётся.
+output_node_profile() {
+    build_profile
+
     show_block "PUBLIC KEY и SHORT ID (для клиентских конфигов)" \
         "PublicKey: ${PUBLIC_KEY}"$'\n'"Short ID:   ${SHORT_ID}"
 
-    show_block "PROFILE ЭТОЙ НОДЫ (вставить в панель)" "${PROFILE_JSON}"
+    if (( CASCADE == 1 )); then
+        show_block "PROFILE RU-НОДЫ (вставить в панель для RU)" "${PROFILE_JSON}"
+        warn "PROFILE EU-ноды выводится на EU-сервере в конце его установки."
+    else
+        show_block "PROFILE ЭТОЙ НОДЫ (вставить в панель)" "${PROFILE_JSON}"
+    fi
+
     warn "Профиль содержит приватный ключ. Не публикуйте его."
     PROFILE_JSON=""
 }
 
-# ============================================================
-# SHOW RESULT
-# ============================================================
-
-show_result() {
-    local mode_name="без self-steal"
-    if (( SELFSTEAL == 1 )); then
-        mode_name="с self-steal"
-    fi
-    if (( CASCADE == 1 )); then
-        mode_name="каскад RU -> EU"
-    fi
-
+# Состояние удаляем только после подтверждения, чтобы при обрыве можно было вывести профиль пунктом 5.
+finish_cascade() {
     echo
-    echo "========================================"
-    echo "          INSTALLATION COMPLETE"
-    echo "========================================"
-    log "Remnawave Node установлен."
-    log "Режим: ${mode_name}"
-    log "Container: ${CONTAINER_NAME}, image: ${IMAGE}"
-    log "Install directory: ${INSTALL_DIR}"
-    if (( SELFSTEAL == 1 )); then
-        log "Домен self-steal: ${SITE_DOMAIN}"
-        log "nginx: ${NGINX_VERSION}"
-    fi
-    if (( CASCADE == 1 )); then
-        log "EU: ${EU_SITE_DOMAIN}"
-    fi
-    if [[ -n "${MAIN_INTERFACE}" ]]; then
-        echo "Network interface: ${MAIN_INTERFACE}"
-        tc qdisc show dev "${MAIN_INTERFACE}" 2>/dev/null || true
-    fi
-    echo "Sysctl: ${SYSCTL_FILE}"
-    echo "Docker daemon: ${DOCKER_DAEMON_JSON}"
-    echo "Docker limits: ${DOCKER_DROPIN}"
-    echo "Journald: ${JOURNALD_DROPIN}"
-    echo "========================================"
+    warn "Скопируйте профиль RU выше."
+    warn "Если сейчас прервать скрипт, можно будет вывести профиль заново пунктом 5."
+    read -r -p "Профиль скопирован, нажмите Enter для удаления состояния с приватным ключом: " _
+    rm -f "${CASCADE_STATE_FILE}"
+    log "Каскад завершён, состояние удалено."
 }
 
 # ============================================================
-# MAIN
+# FLOWS
 # ============================================================
 
-main() {
-    check_system
-    read_existing_secret
-    select_mode
+resume_cascade() {
+    load_cascade_state
 
+    docker_container_exists || die "Контейнер Remnawave Node не найден. Продолжить каскад нельзя."
+    local status
+    status="$(docker inspect -f '{{.State.Status}}' "${CONTAINER_NAME}" 2>/dev/null || true)"
+    [[ "${status}" == "running" ]] || die "Контейнер Remnawave Node не запущен (статус: ${status:-unknown})."
+
+    log "Состояние каскада загружено. Продолжаем с ввода данных EU."
+    cascade_show_eu_instructions
+    cascade_ask_eu_keys
+    output_node_profile
+    finish_cascade
+}
+
+fresh_install() {
     if (( REINSTALL == 0 )); then
         if [[ -d "${INSTALL_DIR}" ]] || docker_container_exists; then
+            if [[ -f "${CASCADE_STATE_FILE}" ]]; then
+                die "Обнаружена установка и незавершённый каскад. Выберите пункт 5 (продолжить) или 4 (переустановка)."
+            fi
             die "Обнаружена существующая установка. Выберите пункт 4 (переустановка)."
         fi
     fi
@@ -1204,20 +1310,76 @@ main() {
 
     if (( SELFSTEAL == 1 )); then
         configure_selfsteal
-        generate_keys
-    else
-        generate_parameters
     fi
 
+    generate_keys
+
     if (( CASCADE == 1 )); then
+        save_cascade_state
         log "Часть для RU готова. Дальше нужно действие на EU."
         cascade_show_eu_instructions
         cascade_ask_eu_keys
+        output_node_profile
+        finish_cascade
+    elif (( SELFSTEAL == 1 )); then
+        output_node_profile
+    else
+        show_plain_parameters
+    fi
+}
+
+# ============================================================
+# SHOW RESULT
+# ============================================================
+
+show_result() {
+    local mode_name="без self-steal"
+    if (( SELFSTEAL == 1 )); then
+        mode_name="с self-steal"
+    fi
+    if (( CASCADE == 1 )); then
+        mode_name="каскад RU -> EU"
     fi
 
+    echo
+    echo "========================================"
+    echo "          INSTALLATION COMPLETE"
+    echo "========================================"
+    log "Remnawave Node установлен."
+    log "Режим: ${mode_name}"
+    log "Container: ${CONTAINER_NAME}, image: ${IMAGE}"
+    log "Install directory: ${INSTALL_DIR}"
     if (( SELFSTEAL == 1 )); then
-        build_profile
-        output_profiles
+        log "Домен self-steal: ${SITE_DOMAIN}"
+        log "nginx: ${NGINX_VERSION:-уже был установлен}"
+    fi
+    if (( CASCADE == 1 )); then
+        log "EU: ${EU_SITE_DOMAIN}"
+    fi
+    if [[ -n "${MAIN_INTERFACE}" ]]; then
+        echo "Network interface: ${MAIN_INTERFACE}"
+        tc qdisc show dev "${MAIN_INTERFACE}" 2>/dev/null || true
+    fi
+    echo "Sysctl: ${SYSCTL_FILE}"
+    echo "Docker daemon: ${DOCKER_DAEMON_JSON}"
+    echo "Docker limits: ${DOCKER_DROPIN}"
+    echo "Journald: ${JOURNALD_DROPIN}"
+    echo "========================================"
+}
+
+# ============================================================
+# MAIN
+# ============================================================
+
+main() {
+    check_system
+    read_existing_secret
+    select_mode
+
+    if (( RESUME == 1 )); then
+        resume_cascade
+    else
+        fresh_install
     fi
 
     show_result
