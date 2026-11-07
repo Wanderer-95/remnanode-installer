@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# Remnawave Node installer v2.0.0
+# Remnawave Node installer v2.1.0
 # Режимы:
 #   1) нода без self-steal
 #   2) нода с self-steal (сайт в /var/www/html, nginx, сертификат)
@@ -11,7 +11,7 @@
 #
 set -Eeuo pipefail
 
-INSTALLER_VERSION="2.0.0"
+INSTALLER_VERSION="2.1.0"
 INSTALLER_URL="https://raw.githubusercontent.com/Wanderer-95/remnanode-installer/main/install.sh"
 
 export DEBIAN_FRONTEND=noninteractive
@@ -34,9 +34,9 @@ JOURNALD_DROPIN="/etc/systemd/journald.conf.d/99-remnanode.conf"
 
 WEB_ROOT="/var/www/html"
 NGINX_CONF="/etc/nginx/conf.d/remnanode-selfsteal.conf"
+NGINX_PREBACKUP="${NGINX_CONF}.pre-remnanode"
 NGINX_BACKUP_DIR="/root/remnanode-backups"
 NGINX_PREV="${NGINX_BACKUP_DIR}/remnanode-selfsteal.conf.prev"
-NGINX_PREBACKUP="${NGINX_CONF}.pre-remnanode"
 DEFAULT_SITE_LINK="/etc/nginx/sites-enabled/default"
 RELOAD_HOOK="/etc/letsencrypt/renewal-hooks/deploy/reload-nginx.sh"
 
@@ -55,7 +55,6 @@ SHORTID_RE='^([0-9a-f]{2}){1,8}$'
 NAME_RE='^[A-Za-z0-9_-]{1,32}$'
 EMAIL_RE='^[^@[:space:]]+@[^@[:space:]]+\.[^@[:space:]]+$'
 
-# Домены, которые идут напрямую с RU (как в рабочем профиле).
 RU_DIRECT_DOMAINS=(
     "geosite:category-ru"
     "domain:vk.com" "domain:vk.ru" "domain:userapi.com"
@@ -92,6 +91,8 @@ NGINX_VERSION=""
 
 WORK_DIR=""
 SITE_SOURCE_DIR=""
+SNAP_NGINX=""
+SNAP_WEB=""
 
 PRIVATE_KEY=""
 PUBLIC_KEY=""
@@ -198,9 +199,8 @@ check_system() {
     # shellcheck disable=SC1091
     . /etc/os-release
     [[ "${ID:-}" == "ubuntu" ]] || die "Поддерживается только Ubuntu."
-    if ! command -v python3 >/dev/null 2>&1; then
-        die "Не найден python3. Установите: apt-get install -y python3"
-    fi
+    command -v python3 >/dev/null 2>&1 || die "Не найден python3. Установите: apt-get install -y python3"
+
     if [[ "${VERSION_ID:-}" != "24.04" ]]; then
         warn "Рекомендуется Ubuntu 24.04. Текущая версия: ${VERSION_ID:-unknown}"
         confirm_continue "Продолжить? [y/N]: "
@@ -320,7 +320,7 @@ backup_file() {
 }
 
 # ============================================================
-# COLLECT ANSWERS (ничего на сервере не меняется)
+# COLLECT ANSWERS (на сервере ещё ничего не меняется)
 # ============================================================
 
 read_secret_key() {
@@ -363,7 +363,6 @@ ask_selfsteal_domain() {
     check_dns_points_here "${SITE_DOMAIN}"
 }
 
-# Выбор: регистрация Let's Encrypt с почтой или без неё.
 ask_certbot_email() {
     local choice=""
     echo
@@ -440,18 +439,12 @@ detect_site_kind() {
     echo "unknown"
 }
 
-# Вставлен ли конфиг nginx вместо сайта. Такой ввод не принимаем: nginx настраивает установщик.
-check_pasted_nginx() {
+# Текст похож на конфиг nginx (server, server_name, listen, ssl_certificate).
+looks_like_nginx_config() {
     local file="$1"
-    if grep -qE '^[[:space:]]*server[[:space:]]*\{' "${file}" ||
-       grep -qE '^[[:space:]]*server_name[[:space:]]' "${file}" ||
-       grep -qE '^[[:space:]]*ssl_certificate[[:space:]]' "${file}" ||
-       grep -qE '^[[:space:]]*listen[[:space:]]+(\[::\]:|[0-9])' "${file}"; then
-        warn "Похоже, вставлен конфиг nginx (server, server_name, listen или ssl_certificate)."
-        warn "Вставляйте только сайт: HTML-страницу или bash-генератор. nginx установщик настроит сам."
-        return 1
-    fi
-    return 0
+    grep -qE '^[[:space:]]*server[[:space:]]*\{' "${file}" ||
+    grep -qE '^[[:space:]]*server_name[[:space:]]' "${file}" ||
+    grep -qE '^[[:space:]]*ssl_certificate[[:space:]]' "${file}"
 }
 
 # Встроенные Python-блоки (<<'PY' ... PY) в генераторе: проверяем синтаксис до запуска.
@@ -505,7 +498,6 @@ PYCHK
 
 warn_generator_style() {
     local file="$1"
-
     if grep -qE '^[[:space:]]*(read|select)[[:space:]]' "${file}"; then
         warn "В генераторе есть интерактивный ввод (read/select). Ввода не будет: возможна ошибка или зависание."
     fi
@@ -514,9 +506,6 @@ warn_generator_style() {
     fi
     if grep -qE '/etc/nginx|/etc/letsencrypt|/etc/ufw' "${file}"; then
         warn "Генератор трогает конфиги nginx, certbot или ufw. Эти изменения будут откатаны установщиком."
-    fi
-    if grep -qE '/var/www/' "${file}" && ! grep -qE '\$1|\$\{1|OUT_DIR|SITE_OUT|WEB_ROOT|SITE_ROOT' "${file}"; then
-        warn "Генератор пишет в фиксированный путь. Сайт должен записываться в каталог из \$1 (он же OUT_DIR)."
     fi
 }
 
@@ -532,10 +521,6 @@ validate_site_input() {
     first="$(sed -n '/[^[:space:]]/{p;q;}' "${file}")"
     if [[ "${first}" == "<?"* || "${first}" == "<%"* ]]; then
         warn "Сайт должен быть статическим (HTML). PHP и серверные шаблоны не поддерживаются."
-        return 1
-    fi
-
-    if ! check_pasted_nginx "${file}"; then
         return 1
     fi
 
@@ -562,7 +547,12 @@ validate_site_input() {
             return 1
             ;;
         *)
-            warn "Не распознан сайт. Нужен HTML (<!DOCTYPE html> или <html>) или bash-генератор (#!/bin/bash)."
+            if looks_like_nginx_config "${file}"; then
+                warn "Похоже, вставлен конфиг nginx. Вставляйте только сайт: HTML или bash-генератор."
+                warn "Конфиг nginx установщик настраивает сам."
+            else
+                warn "Не распознан сайт. Нужен HTML (<!DOCTYPE html> или <html>) или bash-генератор (#!/bin/bash)."
+            fi
             return 1
             ;;
     esac
@@ -575,7 +565,8 @@ collect_site() {
     info " - HTML-страница (начинается с <!DOCTYPE html> или <html>);"
     info " - bash-генератор с первой строкой #!/bin/bash или #!/bin/sh."
     info "Генератор запускается от root без ввода с клавиатуры."
-    info "Он обязан записывать сайт в каталог из первого аргумента \$1 (он же OUT_DIR)."
+    info "Сайт можно писать в каталог из \$1 (он же OUT_DIR). Если генератор пишет в другое место,"
+    info "установщик найдёт сайт сам и опубликует его в ${WEB_ROOT}."
     info "Настраивать nginx, ufw и сертификаты генератору не нужно: это делает установщик."
     info "Вставьте сайт целиком, затем на новой строке нажмите Ctrl+D."
 
@@ -590,6 +581,7 @@ collect_site() {
         warn "Сайт не принят. Исправьте генератор или HTML."
         confirm_continue "Вставить сайт заново? [y/N]: "
         rm -f "${PASTE_TMP}"
+        PASTE_TMP=""
     done
 }
 
@@ -700,30 +692,43 @@ install_packages() {
     wait_for_apt
     apt-get install -y -qq \
         ca-certificates curl gnupg openssl python3 \
-        iproute2 iptables kmod ufw psmisc util-linux
+        iproute2 iptables kmod ufw psmisc util-linux rsync tar
     log "Необходимые пакеты установлены."
 }
 
 install_generator_tools() {
     log "Установка утилит для генератора сайта..."
     wait_for_apt
-    if ! apt-get install -y -qq sudo wget git unzip zip jq rsync tar xz-utils \
+    if ! apt-get install -y -qq sudo wget git unzip zip jq xz-utils \
             python3-pip python3-venv cron >/dev/null 2>&1; then
         warn "Часть вспомогательных пакетов не установилась. Генератор может доставить их сам."
     fi
 }
 
+# Установка Docker с повторами: get.docker.com запускает свой apt, поэтому перед каждой попыткой ждём lock.
 install_docker() {
-    if ! command -v docker >/dev/null 2>&1; then
-        log "Установка Docker..."
-        curl -fsSL https://get.docker.com -o /tmp/get-docker.sh
-        sh /tmp/get-docker.sh
-        rm -f /tmp/get-docker.sh
-    else
+    if command -v docker >/dev/null 2>&1; then
         log "Docker уже установлен."
+    else
+        log "Установка Docker..."
+        local attempt=1 ok=0
+        while (( attempt <= 3 )); do
+            wait_for_apt
+            if curl -fsSL https://get.docker.com -o /tmp/get-docker.sh && sh /tmp/get-docker.sh; then
+                ok=1
+                break
+            fi
+            warn "Установка Docker не удалась (попытка ${attempt}/3). Повтор через 20 секунд."
+            sleep 20
+            attempt=$((attempt + 1))
+        done
+        rm -f /tmp/get-docker.sh
+        if (( ok == 0 )); then
+            die "Не удалось установить Docker. Проверьте процессы apt: ps aux | grep -E 'apt|dpkg'"
+        fi
     fi
 
-    systemctl enable --now docker >/dev/null 2>&1
+    systemctl enable --now docker >/dev/null 2>&1 || true
     docker info >/dev/null 2>&1 || die "Docker не запустился."
     if ! docker compose version >/dev/null 2>&1; then
         wait_for_apt
@@ -749,7 +754,7 @@ install_nginx() {
 }
 
 # ============================================================
-# PORTS (BEFORE ANY CHANGES)
+# PORTS (ДО ЛЮБЫХ ИЗМЕНЕНИЙ)
 # ============================================================
 
 listener_owners() {
@@ -763,7 +768,7 @@ listener_owners() {
         }'
 }
 
-# 443 занимает Xray (rw-core), это штатно. 80 и 8443 нужны для self-steal.
+# 443 занимает Xray (rw-core), это штатно. 80 и 8443 нужны только для self-steal.
 preflight_ports() {
     local port proc bad=""
     while read -r port proc; do
@@ -1018,7 +1023,7 @@ detect_ssh_ports() {
     printf '%s\n' "${candidates}"
 }
 
-# Открываем только нужное. 8443 слушает nginx на 127.0.0.1, наружу не открываем.
+# 8443 слушает nginx только на 127.0.0.1, наружу его не открываем.
 apply_firewall_rules() {
     local port ssh_ports=""
     while read -r port; do
@@ -1173,18 +1178,15 @@ nginx_test_or_show() {
     return 0
 }
 
-# Версия 1.25.1 и новее: http2 задаётся отдельной директивой.
-nginx_http2_style() {
+# nginx 1.25.1 и новее: http2 задаётся отдельной директивой.
+nginx_uses_http2_directive() {
     local v=""
     v="$(nginx -v 2>&1 | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -n1 || true)"
-    if [[ -n "${v}" && "$(printf '%s\n' 1.25.1 "${v}" | sort -V | head -n1)" == "1.25.1" ]]; then
-        echo "new"
-    else
-        echo "old"
-    fi
+    [[ -n "${v}" ]] || return 1
+    [[ "$(printf '%s\n' 1.25.1 "${v}" | sort -V | head -n1)" == "1.25.1" ]]
 }
 
-# Чужие конфиги с этим доменом или портом 8443 не трогаем: при конфликте останавливаемся.
+# Чужой конфиг с этим доменом или портом 8443 не трогаем: при конфликте останавливаемся.
 check_nginx_domain_conflicts() {
     local f dir escaped
     local -a dirs=(/etc/nginx/conf.d /etc/nginx/sites-enabled)
@@ -1194,20 +1196,21 @@ check_nginx_domain_conflicts() {
         [[ -d "${dir}" ]] || continue
         while IFS= read -r -d '' f; do
             [[ "${f}" == "${NGINX_CONF}" ]] && continue
+            [[ "$(basename "${f}")" == remnanode-* ]] && continue
             if grep -qE "^[[:space:]]*server_name[^;]*[[:space:]]${escaped}([[:space:];]|$)" "${f}" 2>/dev/null ||
                grep -qF "/etc/letsencrypt/live/${SITE_DOMAIN}/" "${f}" 2>/dev/null; then
                 warn "Найден конфиг Nginx с доменом ${SITE_DOMAIN}: ${f}"
-                die "Конфликт домена. Чужой конфиг не изменён. Устраните конфликт вручную."
+                die "Конфликт домена. Чужой конфиг не изменён. Уберите его вручную или выберите другой домен."
             fi
             if grep -qE '127\.0\.0\.1:8443' "${f}" 2>/dev/null; then
-                warn "Порт 127.0.0.1:8443 уже используется в ${f}."
+                warn "Порт 127.0.0.1:8443 уже занят конфигом ${f}."
                 die "Конфликт порта 8443. Чужой конфиг не изменён. Уберите его вручную."
             fi
         done < <(find "${dir}" -maxdepth 1 \( -type f -o -type l \) -print0 2>/dev/null)
     done
 }
 
-# Ссылка sites-enabled/default (сайт nginx по умолчанию) мешает: отключаем, с сохранением ссылки.
+# Стандартный сайт nginx (default_server на 80) отключаем, ссылку сохраняем.
 disable_default_site() {
     if [[ -L "${DEFAULT_SITE_LINK}" || -f "${DEFAULT_SITE_LINK}" ]]; then
         mkdir -p "${NGINX_BACKUP_DIR}"
@@ -1233,7 +1236,7 @@ write_nginx_config() {
     mkdir -p /etc/nginx/conf.d "${NGINX_BACKUP_DIR}"
     chmod 700 "${NGINX_BACKUP_DIR}"
 
-    if [[ "$(nginx_http2_style)" == "new" ]]; then
+    if nginx_uses_http2_directive; then
         l8443="listen 127.0.0.1:8443 ssl;"
         h2="http2 on;"
     else
@@ -1453,7 +1456,6 @@ restore_dir() {
     fi
 }
 
-# Если генератор изменил live-каталог, возвращаем его из снимка.
 restore_if_changed() {
     local name="$1" live="$2" snap="$3" diffs=""
     diffs="$(diff -rq "${live}" "${snap}" 2>/dev/null || true)"
@@ -1517,13 +1519,67 @@ reload_nginx_quiet() {
     fi
 }
 
-# Генератор работает в песочнице: ввод закрыт, команды веб-сервера подменены,
-# /etc/nginx и WEB_ROOT откатываются при любом изменении. Сайт берётся только из gen_dir.
+# Копирует из src в dst только файлы, созданные или изменённые после marker.
+# Нужно, чтобы старые файлы в /var/www/html не попали в новый сайт.
+copy_new_files() {
+    local src="$1" dst="$2" marker="$3"
+    (cd "${src}" && find . -type f -newer "${marker}" -print0 | tar --null -cf - -T -) |
+        tar -C "${dst}" -xf -
+}
+
+# Ищет сайт, который записал генератор. Порядок: $1, подкаталоги $1, затем новые index.html в типичных местах.
+# Найденный сайт копируется в gen_dir. Вызывается ДО отката каталогов.
+locate_generated_site() {
+    local gen_dir="$1" marker="$2" cand="" list="" top="" dir="" count=0
+
+    if [[ -f "${gen_dir}/index.html" ]]; then
+        SITE_SOURCE_DIR="${gen_dir}"
+        return 0
+    fi
+
+    cand="$(find "${gen_dir}" -mindepth 2 -maxdepth 4 -type f -name 'index.html' -printf '%d %p\n' 2>/dev/null |
+            sort -n | head -n1 | cut -d' ' -f2- || true)"
+    if [[ -n "${cand}" ]]; then
+        SITE_SOURCE_DIR="$(dirname "${cand}")"
+        warn "index.html найден в подкаталоге генератора: ${SITE_SOURCE_DIR#"${gen_dir}"/}."
+        return 0
+    fi
+
+    list="$(find /var/www /srv /opt /usr/share/nginx /root /home -maxdepth 5 -type f -name 'index.html' \
+            -newer "${marker}" \
+            -not -path "${WORK_DIR}/*" \
+            -not -path '*/node_modules/*' \
+            -not -path '*/.cache/*' \
+            -printf '%T@ %p\n' 2>/dev/null | sort -nr || true)"
+
+    if [[ -z "${list}" ]]; then
+        return 1
+    fi
+
+    count="$(grep -c . <<< "${list}" || true)"
+    top="$(head -n1 <<< "${list}" | cut -d' ' -f2-)"
+    dir="$(dirname "${top}")"
+
+    if (( count > 1 )); then
+        warn "Генератор создал несколько index.html вне \$1. Берём самый новый:"
+        printf '%s\n' "${list}" | cut -d' ' -f2- | sed 's/^/    /' >&2
+    fi
+    warn "Генератор записал сайт вне \$1: ${dir}. Забираем файлы, созданные генератором."
+
+    copy_new_files "${dir}" "${gen_dir}" "${marker}"
+    if [[ ! -f "${gen_dir}/index.html" ]]; then
+        cp -a "${dir}/index.html" "${gen_dir}/index.html"
+    fi
+    SITE_SOURCE_DIR="${gen_dir}"
+    return 0
+}
+
 run_site_generator() {
     local script="$1"
     local gen_dir="${WORK_DIR}/gen-out"
     local shim_dir="${WORK_DIR}/shims"
     local gen_log="${WORK_DIR}/generator.log"
+    local marker="${WORK_DIR}/generator.marker"
     local foreign_before="${WORK_DIR}/foreign-before"
     local rc=0 unit
 
@@ -1546,6 +1602,9 @@ run_site_generator() {
         fi
     done
 
+    touch "${marker}"
+    sleep 1
+
     log "Запуск генератора от root (до ${GENERATOR_TIMEOUT} секунд, ввод отключён)..."
 
     (
@@ -1562,6 +1621,15 @@ run_site_generator() {
 
     rm -f "${gen_dir}/generator.sh"
     stop_new_foreign_web_servers "${foreign_before}"
+
+    # Сначала ищем сайт (пока не откатили каталоги), потом откатываем всё, что генератор изменил сверх сайта.
+    local located=0
+    if (( rc == 0 )); then
+        if locate_generated_site "${gen_dir}" "${marker}"; then
+            located=1
+        fi
+    fi
+
     restore_if_changed "конфигурация nginx" /etc/nginx "${SNAP_NGINX}"
     restore_if_changed "каталог ${WEB_ROOT}" "${WEB_ROOT}" "${SNAP_WEB}"
     ensure_firewall_after_generator
@@ -1581,20 +1649,10 @@ run_site_generator() {
     fi
     check_node_running
 
-    if [[ -f "${gen_dir}/index.html" ]]; then
-        SITE_SOURCE_DIR="${gen_dir}"
-    else
-        local cand=""
-        cand="$(find "${gen_dir}" -mindepth 2 -maxdepth 4 -type f -name 'index.html' -printf '%d %p\n' 2>/dev/null |
-                sort -n | head -n1 | cut -d' ' -f2- || true)"
-        if [[ -n "${cand}" ]]; then
-            SITE_SOURCE_DIR="$(dirname "${cand}")"
-            warn "index.html найден в подкаталоге: ${SITE_SOURCE_DIR#"${gen_dir}"/}. Используем его как корень сайта."
-        else
-            tail -n 30 "${gen_log}" >&2 || true
-            keep_generator_log "${gen_log}"
-            die "Генератор не записал index.html в каталог \$1 (${gen_dir}). Сайт должен писаться в \$1 или OUT_DIR."
-        fi
+    if (( located == 0 )); then
+        tail -n 30 "${gen_log}" >&2 || true
+        keep_generator_log "${gen_log}"
+        die "Генератор не создал index.html ни в \$1, ни в другом месте. Проверьте генератор и лог."
     fi
     log "Сайт сгенерирован."
 }
@@ -1631,7 +1689,7 @@ prepare_final_site() {
     log "Сайт подготовлен: $(find "${final}" -type f | wc -l) файлов, ${size_mb} МБ."
 }
 
-# Публикация в WEB_ROOT: старое содержимое сохраняется в архив, .well-known остаётся.
+# Публикация в WEB_ROOT. Старое содержимое архивируется, .well-known сохраняется.
 publish_site() {
     local final="${WORK_DIR}/final" archive=""
 
@@ -1676,7 +1734,7 @@ install_site() {
             run_site_generator "${norm}"
             ;;
         *)
-            die "Не удалось распознать сайт при установке. Запустите установщик заново и вставьте сайт."
+            die "Не удалось распознать сайт. Запустите установщик заново и вставьте сайт."
             ;;
     esac
 
@@ -1721,7 +1779,6 @@ configure_selfsteal() {
 # XRAY PROFILE: BUILD AND VALIDATE
 # ============================================================
 
-# Проверка xray run -test внутри контейнера ноды на отдельном временном файле.
 validate_xray_config() {
     local json="$1" tmp out="" rc=0
     tmp="$(mktemp /tmp/rw-xray-check.XXXXXX.json)"
@@ -1745,7 +1802,6 @@ validate_xray_config() {
     log "Профиль проверен Xray: Configuration OK."
 }
 
-# Один генератор профиля для режимов с self-steal и каскадом.
 build_profile() {
     PROFILE_JSON="$(
         CASCADE="${CASCADE}" \
@@ -1866,7 +1922,6 @@ output_node_profile() {
         show_block "PROFILE ЭТОЙ НОДЫ (вставить в панель)" "${PROFILE_JSON}"
     fi
     warn "Профиль содержит приватный ключ. Не публикуйте его."
-    warn "Клиенты: в панели создайте пользователя с flow xtls-rprx-vision на этом инбаунде."
     PROFILE_JSON=""
 }
 
@@ -1914,7 +1969,7 @@ load_cascade_state() {
         SELFSTEAL=1
         CASCADE=1
     else
-        die "Состояние каскада повреждено. Запустите пункт 4 (переустановка RU)."
+        die "Состояние каскада повреждено. Запустите пункт 3 заново на RU."
     fi
 }
 
@@ -1959,8 +2014,7 @@ cascade_ask_eu_keys() {
     log "Данные EU приняты."
 }
 
-# Проверка: EU должен отвечать маскировочным сертификатом своего домена.
-# Это значит, что его Reality-вход пересылает неизвестные подключения на заглушку.
+# EU должен отвечать маскировочным сертификатом своего домена (его Reality пересылает чужие подключения на заглушку).
 check_eu_masking() {
     local subject=""
     subject="$(timeout 10 openssl s_client -connect "${EU_SITE_DOMAIN}:443" \
